@@ -359,6 +359,11 @@ def build_warmup_reqs(
             num_inference_steps=sampling_defaults.num_inference_steps,
             num_frames=warmup_num_frames,
         )
+        if hasattr(server_args, "srt_encoder_url") and server_args.srt_encoder_url:
+            include_warmup_image = False
+            logger.warning(
+                "ITI tasks are not supported in the warmup yet when using an external SGLang encoder server."
+            )
         if include_warmup_image:
             if warmup_input_path is None:
                 raise RuntimeError(
