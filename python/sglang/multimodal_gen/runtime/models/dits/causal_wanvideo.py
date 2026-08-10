@@ -56,7 +56,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
     QuantizationConfig,
 )
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
-    _apply_rotary_emb,
+    RotaryEmbedding,
     get_rotary_pos_embed,
 )
 from sglang.multimodal_gen.runtime.layers.visual_embedding import PatchEmbed
@@ -116,6 +116,13 @@ class CausalWanSelfAttention(nn.Module):
             ),
         )
 
+        self.rotary_emb = RotaryEmbedding(
+            head_size=self.head_dim,
+            rotary_dim=self.head_dim,
+            use_precomputed_cache=False,
+            is_neox_style=False,
+        )
+
     def forward(
         self,
         q: torch.Tensor,
@@ -135,8 +142,9 @@ class CausalWanSelfAttention(nn.Module):
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
         """
         cos, sin = freqs_cis
-        roped_query = _apply_rotary_emb(q, cos, sin, is_neox_style=False).type_as(v)
-        roped_key = _apply_rotary_emb(k, cos, sin, is_neox_style=False).type_as(v)
+        roped_query, roped_key = self.rotary_emb(query=q, key=k, cos=cos, sin=sin)
+        roped_query = roped_query.type_as(v)
+        roped_key = roped_key.type_as(v)
 
         if kv_cache is None:
             # Padding for flex attention
