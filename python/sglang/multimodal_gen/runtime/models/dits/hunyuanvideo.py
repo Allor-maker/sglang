@@ -42,7 +42,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
     QuantizationConfig,
 )
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
-    _apply_rotary_emb,
+    RotaryEmbedding,
     get_rotary_pos_embed,
 )
 from sglang.multimodal_gen.runtime.layers.visual_embedding import (
@@ -226,6 +226,13 @@ class MMDoubleStreamBlock(nn.Module):
             prefix=f"{prefix}.attn",
         )
 
+        self.rotary_emb = RotaryEmbedding(
+            head_size=head_dim,
+            rotary_dim=head_dim,
+            use_precomputed_cache=False,
+            is_neox_style=False,
+        )
+
     def forward(
         self,
         img: torch.Tensor,
@@ -274,10 +281,7 @@ class MMDoubleStreamBlock(nn.Module):
         img_k = self.img_attn_k_norm(img_k.contiguous()).to(img_v)
         # Apply rotary embeddings
         cos, sin = freqs_cis
-        img_q, img_k = (
-            _apply_rotary_emb(img_q, cos, sin, is_neox_style=False),
-            _apply_rotary_emb(img_k, cos, sin, is_neox_style=False),
-        )
+        img_q, img_k = self.rotary_emb(query=img_q, key=img_k, cos=cos, sin=sin)
         # Prepare text for attention using fused operation
         txt_attn_input = self.txt_attn_norm(txt, txt_attn_shift, txt_attn_scale)
 
@@ -424,6 +428,13 @@ class MMSingleStreamBlock(nn.Module):
             prefix=f"{prefix}.attn",
         )
 
+        self.rotary_emb = RotaryEmbedding(
+            head_size=head_dim,
+            rotary_dim=head_dim,
+            use_precomputed_cache=False,
+            is_neox_style=False,
+        )
+
     def forward(
         self,
         x: torch.Tensor,
@@ -465,10 +476,7 @@ class MMSingleStreamBlock(nn.Module):
         img_v, txt_v = v[:, :-txt_len], v[:, -txt_len:]
         # Apply rotary embeddings to image parts
         cos, sin = freqs_cis
-        img_q, img_k = (
-            _apply_rotary_emb(img_q, cos, sin, is_neox_style=False),
-            _apply_rotary_emb(img_k, cos, sin, is_neox_style=False),
-        )
+        img_q, img_k = self.rotary_emb(query=img_q, key=img_k, cos=cos, sin=sin)
 
         # Run distributed attention
         if txt_is_sharded:
