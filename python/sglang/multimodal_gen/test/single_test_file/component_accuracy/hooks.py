@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import os
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Optional
 
@@ -411,6 +412,16 @@ def _build_transformer_hook_inputs(
                     torch.cat([img_freqs.real.float(), img_freqs.imag.float()], dim=-1),
                     torch.cat([txt_freqs.real.float(), txt_freqs.imag.float()], dim=-1),
                 )
+                # img_freqs/txt_freqs are already what the complex_freqs
+                # RoPE fast path wants. SGLANG_ACCURACY_FORCE_NO_FREQS_COMPLEX=1
+                # reproduces the pre-complex_freqs behavior for A/B accuracy
+                # comparisons against the same diffusers reference.
+                if (
+                    "freqs_complex" in param_names
+                    and os.environ.get("SGLANG_ACCURACY_FORCE_NO_FREQS_COMPLEX", "0")
+                    != "1"
+                ):
+                    inputs["freqs_complex"] = (img_freqs, txt_freqs)
             else:
                 inputs["freqs_cis"] = (img_freqs, txt_freqs)
         elif "img_ids" in inputs and "txt_ids" in inputs:
