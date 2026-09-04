@@ -555,6 +555,7 @@ def _prepare_transformer_hook_call(
         "img_shapes",
         "txt_seq_lens",
         "freqs_cis",
+        "freqs_complex",
         "additional_t_cond",
         "audio_hidden_states",
         "audio_encoder_hidden_states",
