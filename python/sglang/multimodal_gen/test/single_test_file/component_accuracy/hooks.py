@@ -422,6 +422,19 @@ def _build_transformer_hook_inputs(
                     != "1"
                 ):
                     inputs["freqs_complex"] = (img_freqs, txt_freqs)
+                    print(
+                        f"[DIAG hooks.py] set inputs['freqs_complex'] "
+                        f"img_freqs.shape={tuple(img_freqs.shape)} "
+                        f"txt_freqs.shape={tuple(txt_freqs.shape)}",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        "[DIAG hooks.py] did NOT set freqs_complex "
+                        f"('freqs_complex' in param_names={'freqs_complex' in param_names}, "
+                        f"FORCE_NO env={os.environ.get('SGLANG_ACCURACY_FORCE_NO_FREQS_COMPLEX', '0')})",
+                        flush=True,
+                    )
             else:
                 inputs["freqs_cis"] = (img_freqs, txt_freqs)
         elif "img_ids" in inputs and "txt_ids" in inputs:

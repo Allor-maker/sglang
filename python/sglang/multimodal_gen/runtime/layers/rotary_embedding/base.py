@@ -145,6 +145,14 @@ class RotaryEmbedding(CustomOp):
             and complex_freqs.dim() == 3
             and self._is_complex_style
         )
+        print(
+            f"[DIAG forward_npu] complex_freqs is None={complex_freqs is None} "
+            f"dim={complex_freqs.dim() if complex_freqs is not None else None} "
+            f"_is_complex_style={self._is_complex_style} "
+            f"support_complex_style={support_complex_style} "
+            f"cos_sin_cache is None={cos_sin_cache is None}",
+            flush=True,
+        )
         if support_complex_style:
             return (
                 _apply_rotary_emb_complex(
@@ -358,6 +366,14 @@ class RotaryEmbedding(CustomOp):
             and self._is_full_rotation
             and cos.shape[0] == query.shape[1]
         )
+        print(
+            f"[DIAG forward_native] use_precomputed_cache={use_precomputed_cache} "
+            f"complex_freqs is None={complex_freqs is None} "
+            f"query.dim={query.dim() if query is not None else None} "
+            f"is_complex_derivable={is_complex_derivable} "
+            f"cos_sin_cache is None={cos_sin_cache is None}",
+            flush=True,
+        )
         if is_complex_derivable:
             # No fused kernel for interleaved rotation on native backends;
             # complex-multiply is equivalent and needs fewer kernel
@@ -440,6 +456,7 @@ class RotaryEmbedding(CustomOp):
             )
 
         if complex_freqs is not None:
+            print("[DIAG forward_native] taking complex_freqs branch (4D path)", flush=True)
             return (
                 _apply_rotary_emb_complex(
                     query, complex_freqs, dtype=self._complex_dtype
