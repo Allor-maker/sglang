@@ -47,7 +47,8 @@ def main() -> None:
         sampling_params_kwargs={
             "prompt": "Doraemon is eating dorayaki",
             "negative_prompt": " ",
-            "output_size": "1024x1024",
+            "height": 1024,
+            "width": 1024,
             "guidance_scale": 4.0,
             "num_inference_steps": 50,
             "seed": 42,
