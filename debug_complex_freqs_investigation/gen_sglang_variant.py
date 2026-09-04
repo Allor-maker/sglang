@@ -32,7 +32,9 @@ def main() -> None:
 
     # Import after setting the env var: the toggle is read at pipeline-config
     # call time, not import time, but setting it first avoids any doubt.
-    from sglang import DiffGenerator
+    # Note: DiffGenerator is exported from sglang.multimodal_gen, not the
+    # top-level sglang package (that's the LLM/srt runtime's namespace).
+    from sglang.multimodal_gen import DiffGenerator
 
     gen = DiffGenerator.from_pretrained(
         model_path=args.model_path,
