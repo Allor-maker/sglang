@@ -1,5 +1,6 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
+import os
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -368,10 +369,18 @@ class QwenImagePipelineConfig(QwenImageRolloutPipelineMixin, ImagePipelineConfig
 
         img_complex, txt_complex = freqs_complex
         img_complex = shard_rotary_emb_for_sp(img_complex)
+        # Temporary A/B toggle for the complex_freqs NPU-precision investigation
+        # (SGLANG_QWEN_IMAGE_DISABLE_COMPLEX_FREQS=1 reproduces the
+        # pre-complex_freqs full-generation behavior). Remove once resolved.
+        disable_complex_freqs = (
+            os.environ.get("SGLANG_QWEN_IMAGE_DISABLE_COMPLEX_FREQS", "0") == "1"
+        )
         cond_kwargs = {
             "txt_seq_lens": txt_seq_lens,
             "freqs_cis": (img_cache, txt_cache),
-            "freqs_complex": (img_complex, txt_complex),
+            "freqs_complex": (
+                None if disable_complex_freqs else (img_complex, txt_complex)
+            ),
             "img_shapes": img_shapes,
             "encoder_hidden_states_mask": encoder_hidden_states_mask,
         }
