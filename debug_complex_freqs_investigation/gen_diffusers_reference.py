@@ -14,6 +14,13 @@ installed diffusers version with `help(QwenImagePipeline.__call__)` if the
 output looks unexpected; pipeline signatures do drift across versions.
 
 Run: python gen_diffusers_reference.py
+
+If this still OOMs even with enable_model_cpu_offload() (e.g. another
+process is also holding NPU memory, or the offload hook doesn't fully
+release the transformer's peak activation memory), switch the offload call
+below to pipe.enable_sequential_cpu_offload(device=device) instead --
+moves weights layer-by-layer rather than component-by-component, much
+lower peak memory but noticeably slower.
 """
 
 import torch
@@ -34,7 +41,12 @@ SEED = 42
 def main() -> None:
     pipe = QwenImagePipeline.from_pretrained(MODEL_PATH, torch_dtype=torch.bfloat16)
     device = "npu:0"
-    pipe = pipe.to(device)
+    # text_encoder (~14GB) + transformer (~38GB) + VAE together exceed a
+    # single NPU's memory if all resident at once. This keeps only the
+    # currently-active component on-device, moving others to CPU RAM between
+    # pipeline stages -- same idea as sglang's own component residency
+    # manager, via accelerate's offload hooks instead.
+    pipe.enable_model_cpu_offload(device=device)
 
     generator = torch.Generator(device=device).manual_seed(SEED)
     result = pipe(
