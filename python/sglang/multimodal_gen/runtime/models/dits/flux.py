@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -255,6 +256,10 @@ def _rope_complex_freqs(
     _rope_cos_sin_cache — a raw (cos, sin) tuple, or its already-hoisted
     cat([cos, sin], dim=-1) cache tensor, split back in half."""
     if freqs_cis is None:
+        return None
+    # Temporary A/B toggle for the complex_freqs NPU-precision investigation
+    # (mirrors SGLANG_QWEN_IMAGE_DISABLE_COMPLEX_FREQS). Remove once resolved.
+    if os.environ.get("SGLANG_FLUX_DISABLE_COMPLEX_FREQS", "0") == "1":
         return None
     if isinstance(freqs_cis, torch.Tensor):
         cos, sin = freqs_cis.chunk(2, dim=-1)
