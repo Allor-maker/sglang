@@ -1,5 +1,6 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
+import math
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -25,11 +26,21 @@ from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config impo
 from sglang.multimodal_gen.configs.post_training.pipeline_configs import (
     QwenImageRolloutPipelineMixin,
 )
+from sglang.multimodal_gen.runtime.distributed.cfg_policy import CFGPolicy
 from sglang.multimodal_gen.runtime.utils.condition_expansion import (
     PromptToSampleBatchExpander,
 )
 from sglang.multimodal_gen.runtime.utils.vision import resize
-from sglang.multimodal_gen.utils import calculate_dimensions
+
+
+def _calculate_dimensions(target_area, ratio):
+    width = math.sqrt(target_area * ratio)
+    height = width / ratio
+
+    width = round(width / 32) * 32
+    height = round(height / 32) * 32
+
+    return width, height, None
 
 
 def _extract_masked_hidden(hidden_states: torch.Tensor, mask: torch.Tensor):
@@ -501,7 +512,7 @@ class QwenImageEditPipelineConfig(QwenImagePipelineConfig):
         height = batch.height
         width = batch.width
         image_size = batch.original_condition_image_size
-        edit_width, edit_height, _ = calculate_dimensions(
+        edit_width, edit_height, _ = _calculate_dimensions(
             1024 * 1024, image_size[0] / image_size[1]
         )
         vae_scale_factor = self.get_vae_scale_factor()
@@ -609,7 +620,7 @@ class QwenImageEditPipelineConfig(QwenImagePipelineConfig):
         )
 
     def calculate_condition_image_size(self, image, width, height) -> tuple[int, int]:
-        calculated_width, calculated_height, _ = calculate_dimensions(
+        calculated_width, calculated_height, _ = _calculate_dimensions(
             1024 * 1024, width / height
         )
         return calculated_width, calculated_height
@@ -636,7 +647,7 @@ class QwenImageEditPlusPipelineConfig(QwenImageEditPipelineConfig):
         condition_image_sizes = []
         for img in image:
             image_width, image_height = img.size
-            edit_width, edit_height, _ = calculate_dimensions(
+            edit_width, edit_height, _ = _calculate_dimensions(
                 VAE_IMAGE_SIZE, image_width / image_height
             )
             condition_image_sizes.append((edit_width, edit_height))
@@ -684,13 +695,13 @@ class QwenImageEditPlusPipelineConfig(QwenImageEditPipelineConfig):
         return new_images
 
     def calculate_condition_image_size(self, image, width, height) -> tuple[int, int]:
-        calculated_width, calculated_height, _ = calculate_dimensions(
+        calculated_width, calculated_height, _ = _calculate_dimensions(
             CONDITION_IMAGE_SIZE, width / height
         )
         return calculated_width, calculated_height
 
     def calculate_vae_image_size(self, image, width, height) -> tuple[int, int]:
-        calculated_width, calculated_height, _ = calculate_dimensions(
+        calculated_width, calculated_height, _ = _calculate_dimensions(
             VAE_IMAGE_SIZE, width / height
         )
         return calculated_width, calculated_height
@@ -768,6 +779,9 @@ class QwenImageEditPlus_2511_PipelineConfig(QwenImageEditPlusPipelineConfig):
 class QwenImageLayeredPipelineConfig(QwenImageEditPipelineConfig):
     resolution: int = 640
     vae_precision: str = "bf16"
+    cfg_policy: CFGPolicy = field(
+        default_factory=lambda: CFGPolicy(parallel_uses_serial_arithmetic=True)
+    )
     # promoting the auxiliary components regresses first-request latency
     supports_auto_residency: bool = False
 
