@@ -41,7 +41,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
 )
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     NDRotaryEmbedding,
-    _apply_rotary_emb,
+    RotaryEmbedding,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
@@ -273,10 +273,18 @@ class LingBotVideoAttention(nn.Module):
             quant_config=quant_config,
         )
 
+        self.rotary_emb = RotaryEmbedding(
+            head_size=self.head_dim,
+            rotary_dim=self.head_dim,
+            is_neox_style=False,
+            use_precomputed_cache=False,
+        )
+
     def forward(
         self,
         x: torch.Tensor,
         freqs_cis: tuple[torch.Tensor, torch.Tensor],
+        complex_freqs: torch.Tensor | None = None,
         attention_mask: Optional[torch.Tensor] = None,
         attn_mask_meta: Optional[dict] = None,
     ) -> torch.Tensor:
@@ -288,14 +296,21 @@ class LingBotVideoAttention(nn.Module):
         k = self.norm_k(k.unflatten(2, (self.local_num_heads, self.head_dim)))
         v = v.unflatten(2, (self.local_num_heads, self.head_dim))
 
+        # cos/sin/complex_freqs are indexed by the flattened batch*seq
+        # position table (_joint_position_ids offsets each sample's video
+        # tokens by its own text length), so q/k must be flattened to
+        # [1, B*S, H, D] to line up, then unflattened back afterward.
         B, S, H, D = q.shape
-        # RoPE over the flattened batch; one batched call, the key mask isolates samples.
-        q = _apply_rotary_emb(
-            q.reshape(1, B * S, H, D), cos, sin, is_neox_style=False
-        ).reshape(B, S, H, D)
-        k = _apply_rotary_emb(
-            k.reshape(1, B * S, H, D), cos, sin, is_neox_style=False
-        ).reshape(B, S, H, D)
+        q_flat, k_flat = self.rotary_emb(
+            query=q.reshape(1, B * S, H, D),
+            key=k.reshape(1, B * S, H, D),
+            complex_freqs=complex_freqs,
+            cos=cos,
+            sin=sin,
+        )
+        q = q_flat.reshape(B, S, H, D)
+        k = k_flat.reshape(B, S, H, D)
+
         out = self.attn(
             q,
             k,
@@ -375,6 +390,7 @@ class LingBotVideoBlock(nn.Module):
         x: torch.Tensor,
         temb6: torch.Tensor,
         freqs_cis: tuple[torch.Tensor, torch.Tensor],
+        complex_freqs: torch.Tensor | None = None,
         attention_mask: Optional[torch.Tensor] = None,
         attn_mask_meta: Optional[dict] = None,
     ) -> torch.Tensor:
@@ -399,6 +415,7 @@ class LingBotVideoBlock(nn.Module):
         attn_out = self.attn(
             attn_in,
             freqs_cis,
+            complex_freqs,
             attention_mask=attention_mask,
             attn_mask_meta=attn_mask_meta,
         )
@@ -599,6 +616,11 @@ class LingBotVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
         positions = _joint_position_ids(text_lens, gt, gh, gw, L, device)
         cos, sin = self.rotary_emb.forward_uncached(positions)
         freqs_cis = (cos.float(), sin.float())
+        complex_freqs = (
+            torch.complex(cos.float(), sin.float()).unsqueeze(-2)
+            if cos is not None
+            else None
+        )
 
         attention_mask = attn_mask_meta = None
         # B==1 text is trimmed to true length upstream, so no mask; B>1 may pad, build a key mask.
@@ -625,6 +647,7 @@ class LingBotVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
                 joint,
                 temb6,
                 freqs_cis,
+                complex_freqs,
                 attention_mask,
                 attn_mask_meta,
             )
