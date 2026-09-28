@@ -53,6 +53,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
     QuantizationConfig,
 )
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
+    RotaryEmbedding,
     _apply_rotary_emb,
     get_rotary_pos_embed,
 )
@@ -118,7 +119,22 @@ class HunyuanMLP(MLP):
         return x
 
 
-def _hunyuan_pack_qkv(
+def _pack_qkv(
+    img_q: torch.Tensor,
+    img_k: torch.Tensor,
+    img_v: torch.Tensor,
+    txt_q: torch.Tensor,
+    txt_k: torch.Tensor,
+    txt_v: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return (
+        torch.cat((img_q, txt_q), dim=1),
+        torch.cat((img_k, txt_k), dim=1),
+        torch.cat((img_v, txt_v), dim=1),
+    )
+
+
+def _hunyuan_pack_qkv_reference(
     img_q: torch.Tensor,
     img_k: torch.Tensor,
     img_v: torch.Tensor,
@@ -128,10 +144,65 @@ def _hunyuan_pack_qkv(
     cos: torch.Tensor,
     sin: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return _pack_qkv(
+        _apply_rotary_emb(img_q, cos, sin, is_neox_style=False),
+        _apply_rotary_emb(img_k, cos, sin, is_neox_style=False),
+        img_v,
+        txt_q,
+        txt_k,
+        txt_v,
+    )
+
+
+def _hunyuan_pack_qkv_rotary(
+    img_q: torch.Tensor,
+    img_k: torch.Tensor,
+    img_v: torch.Tensor,
+    txt_q: torch.Tensor,
+    txt_k: torch.Tensor,
+    txt_v: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    *,
+    rotary_emb: RotaryEmbedding,
+    complex_freqs: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    roped_q, roped_k = rotary_emb(
+        query=img_q,
+        key=img_k,
+        cos=cos,
+        sin=sin,
+        complex_freqs=complex_freqs,
+    )
+    return _pack_qkv(roped_q, roped_k, img_v, txt_q, txt_k, txt_v)
+
+
+def _hunyuan_pack_qkv(
+    img_q: torch.Tensor,
+    img_k: torch.Tensor,
+    img_v: torch.Tensor,
+    txt_q: torch.Tensor,
+    txt_k: torch.Tensor,
+    txt_v: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    *,
+    rotary_emb: RotaryEmbedding,
+    complex_freqs: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Apply image RoPE and pack image/text QKV in one bit-exact kernel."""
     if torch.compiler.is_compiling():
-        return _hunyuan_pack_qkv_reference(
-            img_q, img_k, img_v, txt_q, txt_k, txt_v, cos, sin
+        return _hunyuan_pack_qkv_rotary(
+            img_q,
+            img_k,
+            img_v,
+            txt_q,
+            txt_k,
+            txt_v,
+            cos,
+            sin,
+            rotary_emb=rotary_emb,
+            complex_freqs=complex_freqs,
         )
     sig = (
         img_q.dtype,
@@ -155,18 +226,39 @@ def _hunyuan_pack_qkv(
         and (verified or not torch.cuda.is_current_stream_capturing())
     )
     if not can_attempt:
-        return _hunyuan_pack_qkv_reference(
-            img_q, img_k, img_v, txt_q, txt_k, txt_v, cos, sin
+        return _hunyuan_pack_qkv_rotary(
+            img_q,
+            img_k,
+            img_v,
+            txt_q,
+            txt_k,
+            txt_v,
+            cos,
+            sin,
+            rotary_emb=rotary_emb,
+            complex_freqs=complex_freqs,
         )
     try:
         out = hunyuan_qkv_rope_pack(img_q, img_k, img_v, txt_q, txt_k, txt_v, cos, sin)
     except Exception as exc:
         _HUNYUAN_QKV_PACK.on_exception(exc, logger=logger)
-        return _hunyuan_pack_qkv_reference(
-            img_q, img_k, img_v, txt_q, txt_k, txt_v, cos, sin
+        return _hunyuan_pack_qkv_rotary(
+            img_q,
+            img_k,
+            img_v,
+            txt_q,
+            txt_k,
+            txt_v,
+            cos,
+            sin,
+            rotary_emb=rotary_emb,
+            complex_freqs=complex_freqs,
         )
     if verified:
         return out
+    # The kernel is bit-exact against the eager chain, not against
+    # RotaryEmbedding's platform dispatch, so the oracle stays eager; a mismatch
+    # disables the gate and every later call takes the RotaryEmbedding path.
     return _HUNYUAN_QKV_PACK.accept_or_fallback(
         out,
         _hunyuan_pack_qkv_reference(img_q, img_k, img_v, txt_q, txt_k, txt_v, cos, sin),
@@ -176,29 +268,6 @@ def _hunyuan_pack_qkv(
         mismatch_msg=(
             "HunyuanVideo fused QKV RoPE pack is not bit-exact on this platform"
         ),
-    )
-
-
-def _hunyuan_pack_qkv_reference(
-    img_q: torch.Tensor,
-    img_k: torch.Tensor,
-    img_v: torch.Tensor,
-    txt_q: torch.Tensor,
-    txt_k: torch.Tensor,
-    txt_v: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    return (
-        torch.cat(
-            (_apply_rotary_emb(img_q, cos, sin, is_neox_style=False), txt_q),
-            dim=1,
-        ),
-        torch.cat(
-            (_apply_rotary_emb(img_k, cos, sin, is_neox_style=False), txt_k),
-            dim=1,
-        ),
-        torch.cat((img_v, txt_v), dim=1),
     )
 
 
@@ -365,6 +434,12 @@ class MMDoubleStreamBlock(nn.Module):
             prefix=f"{prefix}.attn",
         )
         mark_hunyuan_qknorm_site(self)
+        self.rotary_emb = RotaryEmbedding(
+            head_size=head_dim,
+            rotary_dim=head_dim,
+            use_precomputed_cache=False,
+            is_neox_style=False,
+        )
 
     def forward(
         self,
@@ -374,6 +449,8 @@ class MMDoubleStreamBlock(nn.Module):
         freqs_cis: tuple,
         txt_is_sharded: bool = False,
         seq_lens: list[int] | None = None,
+        *,
+        complex_freqs: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Process modulation vectors
         img_mod_outputs = self.img_mod(vec)
@@ -432,7 +509,18 @@ class MMDoubleStreamBlock(nn.Module):
         )
 
         cos, sin = freqs_cis
-        q, k, v = _hunyuan_pack_qkv(img_q, img_k, img_v, txt_q, txt_k, txt_v, cos, sin)
+        q, k, v = _hunyuan_pack_qkv(
+            img_q,
+            img_k,
+            img_v,
+            txt_q,
+            txt_k,
+            txt_v,
+            cos,
+            sin,
+            rotary_emb=self.rotary_emb,
+            complex_freqs=complex_freqs,
+        )
 
         # Run distributed attention
         if txt_is_sharded:
@@ -563,6 +651,12 @@ class MMSingleStreamBlock(nn.Module):
             prefix=f"{prefix}.attn",
         )
         mark_hunyuan_qknorm_site(self)
+        self.rotary_emb = RotaryEmbedding(
+            head_size=head_dim,
+            rotary_dim=head_dim,
+            use_precomputed_cache=False,
+            is_neox_style=False,
+        )
 
     def forward(
         self,
@@ -572,6 +666,8 @@ class MMSingleStreamBlock(nn.Module):
         freqs_cis: tuple[torch.Tensor, torch.Tensor],
         txt_is_sharded: bool = False,
         seq_lens: list[int] | None = None,
+        *,
+        complex_freqs: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # Process modulation
         mod_shift, mod_scale, mod_gate = self.modulation(vec).chunk(3, dim=-1)
@@ -603,7 +699,18 @@ class MMSingleStreamBlock(nn.Module):
         img_k, txt_k = k[:, :-txt_len], k[:, -txt_len:]
         img_v, txt_v = v[:, :-txt_len], v[:, -txt_len:]
         cos, sin = freqs_cis
-        q, k, v = _hunyuan_pack_qkv(img_q, img_k, img_v, txt_q, txt_k, txt_v, cos, sin)
+        q, k, v = _hunyuan_pack_qkv(
+            img_q,
+            img_k,
+            img_v,
+            txt_q,
+            txt_k,
+            txt_v,
+            cos,
+            sin,
+            rotary_emb=self.rotary_emb,
+            complex_freqs=complex_freqs,
+        )
 
         # Run distributed attention
         if txt_is_sharded:
@@ -890,6 +997,12 @@ class HunyuanVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
 
         freqs_cis = (freqs_cos, freqs_sin) if freqs_cos is not None else None
 
+        complex_freqs = (
+            torch.complex(freqs_cos.float(), freqs_sin.float()).unsqueeze(-2)
+            if freqs_cos is not None
+            else None
+        )
+
         run_transformer_blocks = self.begin_spectrum_step()
         if enable_spectrum and not run_transformer_blocks:
             img = self.spectrum_predict_features(img)
@@ -909,7 +1022,7 @@ class HunyuanVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
                     txt_is_sharded,
                     seq_lens,
                 ]
-                img, txt = block(*double_block_args)
+                img, txt = block(*double_block_args, complex_freqs=complex_freqs)
             # Merge txt and img to pass through single stream blocks
             x = torch.cat((img, txt), 1)
 
@@ -924,7 +1037,7 @@ class HunyuanVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
                         txt_is_sharded,
                         seq_lens,
                     ]
-                    x = block(*single_block_args)
+                    x = block(*single_block_args, complex_freqs=complex_freqs)
 
             # Extract image features
             img = x[:, :img_seq_len, ...]
