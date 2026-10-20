@@ -63,7 +63,7 @@ def _apply_rotary_emb(
 
 def _apply_rotary_emb_complex(
     x: torch.Tensor,  # [b, s, h, d]
-    freqs: torch.Tensor,  # [s, 1, d // 2]
+    freqs: torch.Tensor,  # [s, 1, d // 2] or [b, s, 1, d // 2]
     dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:  # [b, s, h, d]
     """
@@ -75,7 +75,8 @@ def _apply_rotary_emb_complex(
         x: Input activation tensor in bf16/fp16.
             Shape: [batch, num_tokens, num_heads, head_size]
         freqs: Complex-valued frequency tensor, real/imag parts in `dtype`.
-            Shape: [num_tokens, 1, head_size // 2]
+            Shape: [num_tokens, 1, head_size // 2] shared by the batch, or
+            [batch, num_tokens, 1, head_size // 2] per sample.
         dtype: Intermediate real dtype for the complex multiply.
 
     Returns:

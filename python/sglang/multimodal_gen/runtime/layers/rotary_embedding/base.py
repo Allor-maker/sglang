@@ -171,7 +171,9 @@ class RotaryEmbedding(CustomOp):
 
         support_complex_style = (
             complex_freqs is not None
-            and complex_freqs.dim() == 3
+            # [S, 1, D/2] shared by the batch or [B, S, 1, D/2] per sample.
+            and complex_freqs.dim() in (3, 4)
+            and complex_freqs.shape[-2] == 1
             and self._is_complex_style
             and self._is_full_rotation
         )
@@ -410,7 +412,9 @@ class RotaryEmbedding(CustomOp):
 
         support_complex_style = (
             complex_freqs is not None
-            and complex_freqs.dim() == 3
+            # [S, 1, D/2] shared by the batch or [B, S, 1, D/2] per sample.
+            and complex_freqs.dim() in (3, 4)
+            and complex_freqs.shape[-2] == 1
             and self._is_complex_style
             and self._is_full_rotation
         )

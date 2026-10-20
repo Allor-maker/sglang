@@ -47,9 +47,7 @@ from sglang.multimodal_gen.runtime.layers.linear import (
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
 )
-from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
-    apply_flashinfer_rope_qk_inplace,
-)
+from sglang.multimodal_gen.runtime.layers.rotary_embedding import RotaryEmbedding
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 ADALN_EMBED_DIM = 256
@@ -151,6 +149,17 @@ class LLaDAImageRopeEmbedder(nn.Module):
         return torch.cat(frequencies, dim=-1)
 
 
+def _rope_cos_sin_cache(freqs_cis: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    batch_size, seq_len, _ = freqs_cis.shape
+    num_tokens = batch_size * seq_len
+    cos_sin_cache = torch.cat([freqs_cis.real, freqs_cis.imag], dim=-1).reshape(
+        num_tokens, -1
+    )
+    # Rows differ per sample, so positions index the flattened [B*S] table.
+    positions = torch.arange(num_tokens, device=freqs_cis.device, dtype=torch.long)
+    return cos_sin_cache, positions
+
+
 class LLaDAImageAttention(nn.Module):
     def __init__(
         self,
@@ -192,6 +201,12 @@ class LLaDAImageAttention(nn.Module):
         self.norm_k = (
             LLaDAImageRMSNorm(self.head_dim, eps=norm_eps) if qk_norm else None
         )
+        self.rotary_emb = RotaryEmbedding(
+            head_size=self.head_dim,
+            rotary_dim=self.head_dim,
+            is_neox_style=False,
+            use_precomputed_cache=False,
+        )
         self.to_out = nn.ModuleList(
             [
                 RowParallelLinear(
@@ -210,17 +225,14 @@ class LLaDAImageAttention(nn.Module):
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor | None,
         freqs_cis: torch.Tensor,
+        *,
+        rope_cos_sin_cache: torch.Tensor,
+        rope_positions: torch.Tensor,
     ) -> torch.Tensor:
         qkv, _ = self.to_qkv(hidden_states)
         query, key, value = (
             tensor.unflatten(-1, (self.local_heads, self.head_dim)).contiguous()
             for tensor in qkv.split([self.inner_dim] * 3, dim=-1)
-        )
-        cos_sin_cache = torch.cat(
-            [freqs_cis.real.float(), freqs_cis.imag.float()], dim=-1
-        ).reshape(-1, self.head_dim)
-        positions = torch.arange(
-            cos_sin_cache.shape[0], device=query.device, dtype=torch.long
         )
         if self.norm_q is not None:
             query, key = apply_qk_norm_with_optional_rope(
@@ -229,19 +241,19 @@ class LLaDAImageAttention(nn.Module):
                 q_norm=self.norm_q,
                 k_norm=self.norm_k,
                 head_dim=self.head_dim,
-                cos_sin_cache=cos_sin_cache.contiguous(),
-                positions=positions,
+                cos_sin_cache=rope_cos_sin_cache,
+                freqs_complex=freqs_cis,
                 is_neox=False,
+                positions=rope_positions,
                 allow_inplace=True,
             )
         else:
-            query, key = apply_flashinfer_rope_qk_inplace(
-                query,
-                key,
-                cos_sin_cache.contiguous(),
-                head_size=self.head_dim,
-                positions=positions,
-                is_neox=False,
+            query, key = self.rotary_emb(
+                query=query,
+                key=key,
+                positions=rope_positions,
+                complex_freqs=freqs_cis.unsqueeze(-2),
+                cos_sin_cache=rope_cos_sin_cache,
             )
         if attention_mask is not None:
             attention_mask = attention_mask[:, None, None, :]
@@ -354,6 +366,9 @@ class LLaDAImageTransformerBlock(nn.Module):
         noise_mask: torch.Tensor | None = None,
         adaln_noisy: torch.Tensor | None = None,
         adaln_clean: torch.Tensor | None = None,
+        *,
+        rope_cos_sin_cache: torch.Tensor,
+        rope_positions: torch.Tensor,
     ) -> torch.Tensor:
         if self.modulation:
             if noise_mask is None:
@@ -374,6 +389,8 @@ class LLaDAImageTransformerBlock(nn.Module):
                 self.attention_norm1(hidden_states) * (1.0 + scale_msa),
                 attention_mask,
                 freqs_cis,
+                rope_cos_sin_cache=rope_cos_sin_cache,
+                rope_positions=rope_positions,
             )
             hidden_states = apply_rmsnorm_tanh_mul_add(
                 attention_output, gate_msa, hidden_states, self.attention_norm2
@@ -389,6 +406,8 @@ class LLaDAImageTransformerBlock(nn.Module):
                 self.attention_norm1(hidden_states),
                 attention_mask,
                 freqs_cis,
+                rope_cos_sin_cache=rope_cos_sin_cache,
+                rope_positions=rope_positions,
             )
             hidden_states = hidden_states + self.attention_norm2(attention_output)
             hidden_states = hidden_states + self.ffn_norm2(
@@ -914,6 +933,7 @@ class _LLaDAImageTransformer2DModel(ModelMixin, ConfigMixin):
                 image_sequence, self.all_x_embedder[patch_key], self.x_pad_token
             )
         )
+        image_cos_sin_cache, image_positions = _rope_cos_sin_cache(image_frequencies)
         for layer in self.noise_refiner:
             image_features = layer(
                 image_features,
@@ -921,13 +941,22 @@ class _LLaDAImageTransformer2DModel(ModelMixin, ConfigMixin):
                 image_frequencies,
                 noise_mask=image_noise,
                 **adaln,
+                rope_cos_sin_cache=image_cos_sin_cache,
+                rope_positions=image_positions,
             )
 
         cap_features, cap_frequencies, cap_mask, cap_lengths, cap_noise = (
             self._embed_sequence(cap_sequence, self.cap_embedder, self.cap_pad_token)
         )
+        cap_cos_sin_cache, cap_positions = _rope_cos_sin_cache(cap_frequencies)
         for layer in self.context_refiner:
-            cap_features = layer(cap_features, cap_mask, cap_frequencies)
+            cap_features = layer(
+                cap_features,
+                cap_mask,
+                cap_frequencies,
+                rope_cos_sin_cache=cap_cos_sin_cache,
+                rope_positions=cap_positions,
+            )
 
         if is_editing:
             (
@@ -940,9 +969,16 @@ class _LLaDAImageTransformer2DModel(ModelMixin, ConfigMixin):
                 sigvq_sequence, self.sigvq_embedder, self.sigvq_pad_token
             )
             if any(sigvq_lengths):
+                sigvq_cos_sin_cache, sigvq_positions = _rope_cos_sin_cache(
+                    sigvq_frequencies
+                )
                 for layer in self.sigvq_refiner:
                     sigvq_features = layer(
-                        sigvq_features, sigvq_mask, sigvq_frequencies
+                        sigvq_features,
+                        sigvq_mask,
+                        sigvq_frequencies,
+                        rope_cos_sin_cache=sigvq_cos_sin_cache,
+                        rope_positions=sigvq_positions,
                     )
             unified_features, unified_frequencies, unified_mask, unified_noise = (
                 self._merge_padded_sequences(
@@ -961,6 +997,9 @@ class _LLaDAImageTransformer2DModel(ModelMixin, ConfigMixin):
                 )
             )
 
+        unified_cos_sin_cache, unified_positions = _rope_cos_sin_cache(
+            unified_frequencies
+        )
         for layer in self.layers:
             unified_features = layer(
                 unified_features,
@@ -968,6 +1007,8 @@ class _LLaDAImageTransformer2DModel(ModelMixin, ConfigMixin):
                 unified_frequencies,
                 noise_mask=unified_noise,
                 **adaln,
+                rope_cos_sin_cache=unified_cos_sin_cache,
+                rope_positions=unified_positions,
             )
         unified_features = self.all_final_layer[patch_key](
             unified_features, noise_mask=unified_noise, **adaln
