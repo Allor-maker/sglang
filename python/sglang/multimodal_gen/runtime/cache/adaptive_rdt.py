@@ -15,7 +15,8 @@ import torch.distributed as dist
 class AdaptiveRDT:
     min_rdt = 0.01
     max_rdt = 0.99
-    max_change = 0.10
+    max_decrease = 0.50
+    max_increase = 0.10
     min_ratio = 1e-4
     max_ratio = 1e4
     epsilon = 1e-12
@@ -46,6 +47,7 @@ class AdaptiveRDT:
 
     def reset(self):
         self.rdt = None
+        self.desired_rdt = None
         self.ema = None
         self.risk = None
         self.risk_valid = None
@@ -60,6 +62,7 @@ class AdaptiveRDT:
     def initialize(self, reference):
         if self.rdt is None:
             self.rdt = reference.new_tensor(self.initial_rdt, dtype=torch.float32)
+            self.desired_rdt = self.rdt
             # Neutral prior: target / EMA starts at the configured base RDT.
             self.ema = self.rdt.new_tensor(self.target / self.initial_rdt)
             self.clear_risk()
@@ -94,8 +97,10 @@ class AdaptiveRDT:
         )
         self.ema = torch.where(valid, candidate, self.ema)
         desired = (self.target / self.ema).clamp(self.min_rdt, self.max_rdt)
+        self.desired_rdt = desired
         limited = desired.clamp(
-            self.rdt * (1 - self.max_change), self.rdt * (1 + self.max_change)
+            self.rdt * (1 - self.max_decrease),
+            self.rdt * (1 + self.max_increase),
         ).clamp(self.min_rdt, self.max_rdt)
         self.rdt = torch.where(valid, limited, self.rdt)
         self.error = torch.where(valid, error, float("nan"))
@@ -134,7 +139,7 @@ class AdaptiveRDT:
             self.step_risk if exact else self.risk,
             self.error if self.error is not None else missing,
             self.ratio if self.ratio is not None else missing,
-            self.ema, self.rdt,
+            self.ema, self.rdt, self.desired_rdt,
         ))
         self.records.append((step, exact, probe, values))
 
@@ -142,14 +147,14 @@ class AdaptiveRDT:
         if not self.records:
             return
         values = torch.stack([record[3] for record in self.records]).cpu().tolist()
-        for (step, exact, probe, _), (risk, error, ratio, ema, rdt) in zip(
+        for (step, exact, probe, _), (risk, error, ratio, ema, rdt, desired) in zip(
             self.records, values
         ):
             logger.info(
                 "Adaptive RDT step=%d mode=%s shadow=%s probe=%s "
-                "risk=%g error=%g ratio=%g ratio_ema=%g rdt=%g",
+                "risk=%g error=%g ratio=%g ratio_ema=%g rdt=%g rdt_desired=%g",
                 step, "exact" if exact else "reuse", self.shadow, probe,
-                risk, error, ratio, ema, rdt,
+                risk, error, ratio, ema, rdt, desired,
             )
         self.records.clear()
 
