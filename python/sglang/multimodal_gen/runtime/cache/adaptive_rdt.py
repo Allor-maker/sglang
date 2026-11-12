@@ -14,9 +14,10 @@ import torch.distributed as dist
 
 class AdaptiveRDT:
     min_rdt = 0.01
-    max_rdt = 0.99
+    max_rdt = 1.0
     max_decrease = 0.50
     max_increase = 0.10
+    # Numerical protection only; no narrow band tying RDT to its start value.
     min_ratio = 1e-4
     max_ratio = 1e4
     epsilon = 1e-12
@@ -24,22 +25,18 @@ class AdaptiveRDT:
     def __init__(
         self,
         initial_rdt: float,
-        target: float,
         decay: float,
         *,
         shadow: bool = False,
         probe_interval: int = 16,
     ):
         if not self.min_rdt <= initial_rdt <= self.max_rdt:
-            raise ValueError("Adaptive RDT requires initial RDT in [0.01, 0.99]")
-        if not math.isfinite(target) or target <= 0:
-            raise ValueError("SGLANG_CACHE_DIT_TARGET_ERROR must be finite and > 0")
+            raise ValueError("Adaptive RDT requires initial RDT in [0.01, 1.0]")
         if not math.isfinite(decay) or not 0 <= decay < 1:
             raise ValueError("SGLANG_CACHE_DIT_RDT_EMA must be in [0, 1)")
         if probe_interval < 2:
             raise ValueError("SGLANG_CACHE_DIT_RDT_PROBE_INTERVAL must be >= 2")
         self.initial_rdt = initial_rdt
-        self.target = target
         self.decay = decay
         self.shadow = shadow
         self.probe_interval = probe_interval
@@ -63,8 +60,8 @@ class AdaptiveRDT:
         if self.rdt is None:
             self.rdt = reference.new_tensor(self.initial_rdt, dtype=torch.float32)
             self.desired_rdt = self.rdt
-            # Neutral prior: target / EMA starts at the configured base RDT.
-            self.ema = self.rdt.new_tensor(self.target / self.initial_rdt)
+            # E/B=1 means the proxy is calibrated: scale=1, RDT=base RDT.
+            self.ema = torch.ones_like(self.rdt)
             self.clear_risk()
 
     def clear_risk(self):
@@ -96,7 +93,7 @@ class AdaptiveRDT:
             self.min_ratio, self.max_ratio
         )
         self.ema = torch.where(valid, candidate, self.ema)
-        desired = (self.target / self.ema).clamp(self.min_rdt, self.max_rdt)
+        desired = (self.initial_rdt / self.ema).clamp(self.min_rdt, self.max_rdt)
         self.desired_rdt = desired
         limited = desired.clamp(
             self.rdt * (1 - self.max_decrease),
@@ -169,7 +166,6 @@ def enable_adaptive_rdt(transformer, initial_rdt, logger):
 
     controller = AdaptiveRDT(
         initial_rdt,
-        envs.SGLANG_CACHE_DIT_TARGET_ERROR,
         envs.SGLANG_CACHE_DIT_RDT_EMA,
         shadow=shadow,
         probe_interval=envs.SGLANG_CACHE_DIT_RDT_PROBE_INTERVAL,

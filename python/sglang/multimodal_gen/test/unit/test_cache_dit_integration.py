@@ -359,7 +359,6 @@ class TestBuildCustomBlockAdapter(unittest.TestCase):
         envs = types.ModuleType("sglang.multimodal_gen.envs")
         envs.SGLANG_CACHE_DIT_ADAPTIVE_RDT = True
         envs.SGLANG_CACHE_DIT_ADAPTIVE_RDT_SHADOW = False
-        envs.SGLANG_CACHE_DIT_TARGET_ERROR = 0.01
         envs.SGLANG_CACHE_DIT_RDT_EMA = 0.9
         envs.SGLANG_CACHE_DIT_RDT_PROBE_INTERVAL = 16
         stubs[envs.__name__] = envs

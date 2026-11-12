@@ -159,6 +159,12 @@ def _patch_cache_dit_similarity():
             if not adaptive.shadow:
                 threshold = calibrated
                 self.current_context.cache_config.residual_diff_threshold = threshold
+            elif threshold >= 1.0:
+                # Preserve stock cache-dit's unconditional reuse in shadow.
+                # Active mode deliberately treats 1 as a numeric threshold;
+                # feature differences above were still collected for feedback.
+                self.add_residual_diff(-1.0)
+                return True
         self.add_residual_diff(diff)
         return diff < threshold
 
