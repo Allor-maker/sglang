@@ -350,6 +350,47 @@ def _make_transformer(class_name, layers=None):
 
 
 class TestBuildCustomBlockAdapter(unittest.TestCase):
+    def test_adaptive_mount_uses_persistent_manager_with_native_blocks(self):
+        # cache-dit swaps in CachedBlocks only during forward. A native first
+        # block must not prevent mounting adaptive hooks before generation.
+        stubs = _install_sglang_dependency_stubs()
+        stubs.update(_install_torch_stub())
+        stubs["torch"].compiler = types.SimpleNamespace(disable=lambda fn: fn)
+        envs = types.ModuleType("sglang.multimodal_gen.envs")
+        envs.SGLANG_CACHE_DIT_ADAPTIVE_RDT = True
+        envs.SGLANG_CACHE_DIT_ADAPTIVE_RDT_SHADOW = False
+        envs.SGLANG_CACHE_DIT_TARGET_ERROR = 0.01
+        envs.SGLANG_CACHE_DIT_RDT_EMA = 0.9
+        envs.SGLANG_CACHE_DIT_RDT_PROBE_INTERVAL = 16
+        stubs[envs.__name__] = envs
+        stubs["sglang.multimodal_gen"].envs = envs
+        context = types.SimpleNamespace(cache_config=types.SimpleNamespace())
+        manager = types.SimpleNamespace(
+            current_context=context,
+            set_context=lambda name: None,
+            is_calibrator_enabled=lambda: False,
+            enable_separate_cfg=lambda: False,
+            is_cache_residual=lambda: True,
+            can_cache=lambda *args, **kwargs: False,
+            set_Bn_buffer=lambda *args, **kwargs: None,
+        )
+        native_block = object()
+        transformer = types.SimpleNamespace(
+            blocks=[native_block], _context_manager=manager, _context_names=["h3"]
+        )
+        original_decide = manager.can_cache
+        original_commit = manager.set_Bn_buffer
+        path = Path(__file__).resolve().parents[2] / "runtime/cache/adaptive_rdt.py"
+        with patch.dict(sys.modules, stubs):
+            spec = importlib.util.spec_from_file_location("adaptive_mount_test", path)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            self.assertTrue(module.enable_adaptive_rdt(transformer, 0.5, Mock()))
+        self.assertIs(transformer.blocks[0], native_block)
+        self.assertIsNot(manager.can_cache, original_decide)
+        self.assertIsNot(manager.set_Bn_buffer, original_commit)
+        self.assertEqual(manager._sglang_adaptive_rdt.initial_rdt, 0.5)
+
     def test_fsdp_subclass_preserves_native_adapter(self):
         module = _import_module_with_stub()
         for name, attr, multimodal, pattern in (

@@ -169,9 +169,14 @@ def enable_adaptive_rdt(transformer, initial_rdt, logger):
         shadow=shadow,
         probe_interval=envs.SGLANG_CACHE_DIT_RDT_PROBE_INTERVAL,
     )
-    wrapper = transformer.blocks[0]
-    manager = wrapper.context_manager
-    manager.set_context(wrapper.cache_context)
+    # cache-dit 1.5.1 swaps model.blocks only inside transformer.forward.
+    # Its persistent manager is available at mount time; instrument that
+    # instance instead of assuming blocks[0] is already a CachedBlocks wrapper.
+    manager = transformer._context_manager
+    context_names = transformer._context_names
+    if len(context_names) != 1:
+        raise ValueError("Adaptive RDT requires one H3 cache context")
+    manager.set_context(context_names[0])
     config = manager.current_context.cache_config
     if (
         getattr(config, "steps_computation_mask", None) is not None
@@ -190,63 +195,57 @@ def enable_adaptive_rdt(transformer, initial_rdt, logger):
         raise ValueError("Adaptive RDT requires H3's single-stream residual cache")
 
     manager._sglang_adaptive_rdt = controller
-    original_fn = wrapper.call_Fn_blocks
-    original_middle = wrapper.call_Mn_blocks
-    original_outputs = wrapper._process_forward_outputs
     original_can_cache = manager.can_cache
+    original_set_buffer = manager.set_Bn_buffer
     active_context = None
-    exact = False
+    prediction = None
     probe = False
 
+    def record(exact):
+        controller.record(manager.get_current_step(), exact, probe)
+        last_step = manager.current_context.cache_config.num_inference_steps - 1
+        if manager.get_current_step() == last_step:
+            controller.flush(logger)
+
     @torch.compiler.disable
-    def prepare(hidden_states):
-        nonlocal active_context, exact, probe
+    def can_cache(states_tensor, parallelized=False, threshold=None, prefix="Fn"):
+        nonlocal active_context, prediction, probe
         context = manager.current_context
         if context is not active_context:
             controller.reset()
             context.cache_config.residual_diff_threshold = initial_rdt
             active_context = context
-        controller.initialize(hidden_states)
+        controller.initialize(states_tensor)
         controller.error = None
         controller.ratio = None
         controller.step_risk = None
-        exact = probe = False
-
-    @torch.compiler.disable
-    def can_cache(*args, **kwargs):
-        nonlocal probe
-        reuse = original_can_cache(*args, **kwargs)
+        prediction = None
+        probe = False
+        reuse = original_can_cache(
+            states_tensor, parallelized=parallelized, threshold=threshold, prefix=prefix
+        )
         if (
             reuse
             and not manager.is_in_warmup()
             and controller.should_probe(manager.get_current_step())
         ):
             probe = True
-            return False
-        return reuse
-
-    def call_fn(hidden_states, *args, **kwargs):
-        prepare(hidden_states)
-        return original_fn(hidden_states, *args, **kwargs)
-
-    @torch.compiler.disable
-    def predict(hidden_states):
-        nonlocal exact
-        exact = True
-        if (
+            reuse = False
+        if reuse:
+            record(exact=False)
+        elif (
             controller.has_history
             and controller.risk_samples > 0
             and not manager.is_in_warmup()
         ):
-            residual = manager.get_Bn_buffer(
-                prefix=f"{wrapper.cache_prefix}_Bn_residual"
-            )
-            if residual is not None and residual.shape == hidden_states.shape:
-                return residual
-        return None
+            # Read the same residual stream that Pattern_3.apply_cache would
+            # use, before the middle forward and before its exact commit.
+            cache_prefix = prefix.rsplit("_Fn_", 1)[0]
+            prediction = manager.get_Bn_buffer(prefix=f"{cache_prefix}_Bn_residual")
+        return reuse
 
     @torch.compiler.disable
-    def observe(prediction, actual):
+    def set_buffer(buffer, prefix="Bn"):
         if (
             controller.has_history
             and controller.risk_samples > 0
@@ -257,28 +256,17 @@ def enable_adaptive_rdt(transformer, initial_rdt, logger):
                 or getattr(manager, "_sglang_sp_group", None)
                 or getattr(manager, "_sglang_tp_group", None)
             )
-            controller.observe(prediction, actual, group)
+            valid_prediction = prediction
+            if prediction is not None and prediction.shape != buffer.shape:
+                valid_prediction = None
+            # Pattern_3 supplies its actual middle residual here. Calibrate
+            # before the original setter updates TaylorSeer derivatives/cache.
+            controller.observe(valid_prediction, buffer, group)
+        result = original_set_buffer(buffer, prefix=prefix)
         controller.anchor(manager.get_current_step())
-
-    def call_middle(hidden_states, *args, **kwargs):
-        prediction = predict(hidden_states)
-        result = original_middle(hidden_states, *args, **kwargs)
-        # Pattern_3 commits result[2] only after this method returns; this is
-        # the actual residual of the cached middle segment, before the Bn tail.
-        observe(prediction, result[2])
-        return result
-
-    @torch.compiler.disable
-    def process_outputs(*args, **kwargs):
-        result = original_outputs(*args, **kwargs)
-        controller.record(manager.get_current_step(), exact, probe)
-        last_step = manager.current_context.cache_config.num_inference_steps - 1
-        if manager.get_current_step() == last_step:
-            controller.flush(logger)
+        record(exact=True)
         return result
 
     manager.can_cache = can_cache
-    wrapper.call_Fn_blocks = call_fn
-    wrapper.call_Mn_blocks = call_middle
-    wrapper._process_forward_outputs = process_outputs
+    manager.set_Bn_buffer = set_buffer
     return True
