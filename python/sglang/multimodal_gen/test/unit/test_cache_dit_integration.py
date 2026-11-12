@@ -131,7 +131,7 @@ def _install_sglang_dependency_stubs():
     adaptive_rdt = types.ModuleType("sglang.multimodal_gen.runtime.cache.adaptive_rdt")
     # These tests exercise mount plumbing with Adaptive RDT disabled. The real
     # controller/opt-out contract has separate CPU tensor coverage.
-    adaptive_rdt.enable_adaptive_rdt = lambda *_args: False
+    adaptive_rdt.enable_adaptive_rdt = lambda *_args, **_kwargs: False
 
     return {
         "sglang": sglang,
@@ -372,10 +372,17 @@ class TestBuildCustomBlockAdapter(unittest.TestCase):
             is_cache_residual=lambda: True,
             can_cache=lambda *args, **kwargs: False,
             set_Bn_buffer=lambda *args, **kwargs: None,
+            Fn_compute_blocks=lambda: 1,
+            Bn_compute_blocks=lambda: 1,
         )
-        native_block = object()
+        native_block = types.SimpleNamespace(
+            register_forward_pre_hook=Mock(return_value=Mock()),
+            register_forward_hook=Mock(return_value=Mock()),
+        )
         transformer = types.SimpleNamespace(
-            blocks=[native_block], _context_manager=manager, _context_names=["h3"]
+            blocks=[object(), native_block, object()],
+            _context_manager=manager,
+            _context_names=["h3"],
         )
         original_decide = manager.can_cache
         original_commit = manager.set_Bn_buffer
@@ -385,7 +392,8 @@ class TestBuildCustomBlockAdapter(unittest.TestCase):
             module = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(module)
             self.assertTrue(module.enable_adaptive_rdt(transformer, 0.5, Mock()))
-        self.assertIs(transformer.blocks[0], native_block)
+        self.assertIs(transformer.blocks[1], native_block)
+        self.assertEqual(len(transformer._sglang_adaptive_rdt_hooks), 2)
         self.assertIsNot(manager.can_cache, original_decide)
         self.assertIsNot(manager.set_Bn_buffer, original_commit)
         self.assertEqual(manager._sglang_adaptive_rdt.initial_rdt, 0.5)

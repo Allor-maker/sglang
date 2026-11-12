@@ -54,6 +54,11 @@ class AdaptiveRDT:
         self.step_risk = None
         self.has_history = False
         self.last_anchor_step = -1
+        self.last_feedback_step = 0
+        self.compared = False
+        self.budget_triggered = False
+        self.feedback_eligible = False
+        self.reason = "bootstrap"
         self.records = []
 
     def initialize(self, reference):
@@ -75,6 +80,7 @@ class AdaptiveRDT:
         valid = torch.isfinite(difference) & (difference >= 0)
         self.risk_valid = self.risk_valid & valid
         self.risk = self.risk + torch.where(valid, difference, 0.0)
+        self.risk_valid = self.risk_valid & torch.isfinite(self.risk)
         self.risk_samples += 1
 
     def update(self, error):
@@ -104,12 +110,14 @@ class AdaptiveRDT:
         self.ratio = torch.where(valid, ratio, float("nan"))
 
     def observe(self, prediction, actual, group):
-        # E is relative MSE of the residual, not of the hidden-state output.
-        actual = actual.detach().float()
-        if prediction is None:
+        # E is relative MSE of the actual cached-segment output.
+        if actual is None:
+            moments = self.rdt.new_tensor([float("nan"), 1.0])
+        elif prediction is None:
             # Participate even if one shard has invalid prediction history.
             moments = actual.new_tensor([float("nan"), 1.0])
         else:
+            actual = actual.detach().float()
             delta = prediction.detach().float() - actual
             moments = torch.stack((delta.square().sum(), actual.square().sum()))
         if group is not None and dist.get_world_size(group) > 1:
@@ -121,7 +129,7 @@ class AdaptiveRDT:
             not self.shadow
             and self.has_history
             and self.risk_samples > 0
-            and step - self.last_anchor_step >= self.probe_interval
+            and step - self.last_feedback_step >= self.probe_interval
         )
 
     def anchor(self, step):
@@ -138,26 +146,31 @@ class AdaptiveRDT:
             self.ratio if self.ratio is not None else missing,
             self.ema, self.rdt, self.desired_rdt,
         ))
-        self.records.append((step, exact, probe, values))
+        self.records.append((
+            step, exact, probe, self.reason, self.feedback_eligible, values
+        ))
 
     def flush(self, logger):
         if not self.records:
             return
-        values = torch.stack([record[3] for record in self.records]).cpu().tolist()
-        for (step, exact, probe, _), (risk, error, ratio, ema, rdt, desired) in zip(
-            self.records, values
-        ):
+        values = torch.stack([record[5] for record in self.records]).cpu().tolist()
+        for record, scalars in zip(self.records, values):
+            step, exact, probe, reason, feedback, _ = record
+            risk, error, ratio, ema, rdt, desired = scalars
             logger.info(
                 "Adaptive RDT step=%d mode=%s shadow=%s probe=%s "
+                "reason=%s feedback_eligible=%s metric=middle_output_relative_mse "
                 "risk=%g error=%g ratio=%g ratio_ema=%g rdt=%g rdt_desired=%g",
-                step, "exact" if exact else "reuse", self.shadow, probe,
+                step, "exact" if exact else "reuse", self.shadow, probe, reason, feedback,
                 risk, error, ratio, ema, rdt, desired,
             )
         self.records.clear()
 
 
-def enable_adaptive_rdt(transformer, initial_rdt, logger):
-    """Instrument the mounted H3 wrapper without changing cache commits or MC."""
+def enable_adaptive_rdt(
+    transformer, initial_rdt, logger, *, feature_difference=None
+):
+    """Route on cumulative DBCache risk; calibrate budget/probe exacts only."""
     from sglang.multimodal_gen import envs
 
     shadow = envs.SGLANG_CACHE_DIT_ADAPTIVE_RDT_SHADOW
@@ -170,9 +183,8 @@ def enable_adaptive_rdt(transformer, initial_rdt, logger):
         shadow=shadow,
         probe_interval=envs.SGLANG_CACHE_DIT_RDT_PROBE_INTERVAL,
     )
-    # cache-dit 1.5.1 swaps model.blocks only inside transformer.forward.
-    # Its persistent manager is available at mount time; instrument that
-    # instance instead of assuming blocks[0] is already a CachedBlocks wrapper.
+    # cache-dit swaps native blocks only inside forward. Its persistent manager
+    # and the native blocks are both accessible here, before compilation.
     manager = transformer._context_manager
     context_names = transformer._context_names
     if len(context_names) != 1:
@@ -195,12 +207,25 @@ def enable_adaptive_rdt(transformer, initial_rdt, logger):
     if manager.enable_separate_cfg() or not manager.is_cache_residual():
         raise ValueError("Adaptive RDT requires H3's single-stream residual cache")
 
+    blocks = transformer.blocks
+    first = manager.Fn_compute_blocks()
+    stop = len(blocks) - manager.Bn_compute_blocks()
+    if not 0 <= first < stop <= len(blocks):
+        raise ValueError("Adaptive RDT requires a nonempty cached middle segment")
+
     manager._sglang_adaptive_rdt = controller
     original_can_cache = manager.can_cache
     original_set_buffer = manager.set_Bn_buffer
     active_context = None
-    prediction = None
+    prediction = predicted_output = actual_output = None
     probe = False
+
+    def group():
+        return (
+            getattr(manager, "_sglang_tp_sp_group", None)
+            or getattr(manager, "_sglang_sp_group", None)
+            or getattr(manager, "_sglang_tp_group", None)
+        )
 
     def record(exact):
         controller.record(manager.get_current_step(), exact, probe)
@@ -209,63 +234,138 @@ def enable_adaptive_rdt(transformer, initial_rdt, logger):
             controller.flush(logger)
 
     @torch.compiler.disable
+    def capture_input(_module, args):
+        nonlocal prediction, predicted_output
+        if controller.feedback_eligible and prediction is not None:
+            hidden_states = args[0]
+            if prediction.shape == hidden_states.shape:
+                # Exactly the hypothetical residual reuse performed by
+                # Pattern_3.apply_cache, on the *current* middle input.
+                predicted_output = prediction + hidden_states
+            prediction = None
+
+    @torch.compiler.disable
+    def capture_output(_module, _args, output):
+        nonlocal actual_output
+        if controller.feedback_eligible:
+            actual_output = output.detach()
+
+    hooks = []
+    try:
+        hooks.append(blocks[first].register_forward_pre_hook(capture_input))
+        hooks.append(blocks[stop - 1].register_forward_hook(capture_output))
+    except Exception:
+        for hook in hooks:
+            hook.remove()
+        raise
+    transformer._sglang_adaptive_rdt_hooks = tuple(hooks)
+
+    @torch.compiler.disable
     def can_cache(states_tensor, parallelized=False, threshold=None, prefix="Fn"):
-        nonlocal active_context, prediction, probe
+        nonlocal active_context, prediction, predicted_output, actual_output, probe
         context = manager.current_context
         if context is not active_context:
             controller.reset()
             context.cache_config.residual_diff_threshold = initial_rdt
             active_context = context
         controller.initialize(states_tensor)
-        controller.error = None
-        controller.ratio = None
-        controller.step_risk = None
-        prediction = None
+        controller.error = controller.ratio = controller.step_risk = None
+        controller.compared = controller.budget_triggered = False
+        controller.feedback_eligible = False
+        prediction = predicted_output = actual_output = None
         probe = False
+        warmup = manager.is_in_warmup()
+        mask_due = (
+            manager.is_steps_computation_mask_enabled()
+            and manager.is_in_full_compute_steps()
+        )
+        max_cached = manager.get_max_cached_steps()
+        total_due = max_cached >= 0 and len(manager.get_cached_steps()) >= max_cached
+        mc = manager.get_max_continuous_cached_steps()
+        mc_due = mc >= 0 and manager.get_continuous_cached_steps() >= mc
         reuse = original_can_cache(
             states_tensor, parallelized=parallelized, threshold=threshold, prefix=prefix
         )
+        if warmup:
+            controller.reason = "warmup"
+        elif mask_due:
+            controller.reason = "mask"
+        elif total_due:
+            controller.reason = "max_cached"
+        elif reuse:
+            controller.reason = "reuse"
+        elif controller.compared:
+            controller.reason = "budget" if controller.budget_triggered else "threshold"
+        elif mc_due:
+            controller.reason = "mc"
+        else:
+            controller.reason = "guard" if controller.has_history else "bootstrap"
+
+        # Early guards (notably MC) bypass similarity. Still include the exact
+        # endpoint in B using the same feature metric, without a host transfer
+        # and without changing the guard's decision or DBCache statistics.
+        if not controller.compared and not warmup and controller.has_history:
+            previous = manager.get_Fn_buffer(prefix)
+            if previous is not None:
+                current = states_tensor
+                factor = manager.get_downsample_factor()
+                if factor > 1:
+                    current = current[..., ::factor].contiguous()
+                diff_fn = feature_difference
+                if diff_fn is None:
+                    from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
+                        _cache_dit_feature_diff,
+                    )
+
+                    diff_fn = _cache_dit_feature_diff
+                controller.add_risk(
+                    diff_fn(manager, previous, current, group(), check_shape=True)
+                )
+
+        # Count time since feedback, not since any anchor: frequent MC exacts
+        # must not prevent deliberately scheduled calibration probes forever.
         if (
-            reuse
-            and not manager.is_in_warmup()
+            not warmup
+            and controller.reason in ("reuse", "mc")
             and controller.should_probe(manager.get_current_step())
         ):
             probe = True
             reuse = False
+            controller.reason = "probe"
+        controller.feedback_eligible = (
+            not reuse
+            and not warmup
+            and controller.reason in ("budget", "probe")
+            and controller.has_history
+            and controller.risk_samples > 0
+        )
         if reuse:
             record(exact=False)
-        elif (
-            controller.has_history
-            and controller.risk_samples > 0
-            and not manager.is_in_warmup()
-        ):
-            # Read the same residual stream that Pattern_3.apply_cache would
-            # use, before the middle forward and before its exact commit.
+        elif controller.feedback_eligible:
             cache_prefix = prefix.rsplit("_Fn_", 1)[0]
             prediction = manager.get_Bn_buffer(prefix=f"{cache_prefix}_Bn_residual")
         return reuse
 
     @torch.compiler.disable
     def set_buffer(buffer, prefix="Bn"):
-        if (
-            controller.has_history
-            and controller.risk_samples > 0
-            and not manager.is_in_warmup()
-        ):
-            group = (
-                getattr(manager, "_sglang_tp_sp_group", None)
-                or getattr(manager, "_sglang_sp_group", None)
-                or getattr(manager, "_sglang_tp_group", None)
-            )
-            valid_prediction = prediction
-            if prediction is not None and prediction.shape != buffer.shape:
-                valid_prediction = None
-            # Pattern_3 supplies its actual middle residual here. Calibrate
-            # before the original setter updates TaylorSeer derivatives/cache.
-            controller.observe(valid_prediction, buffer, group)
+        nonlocal prediction, predicted_output, actual_output
+        if controller.feedback_eligible:
+            measured = actual_output
+            if measured is None:
+                # Invalid capture participates in the same reduction on all
+                # ranks and cannot update EMA. Never substitute residual MSE.
+                predicted_output = None
+                controller.reason += "_output_unavailable"
+            if predicted_output is not None and predicted_output.shape != measured.shape:
+                predicted_output = None
+            controller.observe(predicted_output, measured, group())
+            controller.last_feedback_step = manager.get_current_step()
+        # Commit the true residual/TaylorSeer derivatives only after measuring
+        # the counterfactual middle output against the real output.
         result = original_set_buffer(buffer, prefix=prefix)
         controller.anchor(manager.get_current_step())
         record(exact=True)
+        prediction = predicted_output = actual_output = None
         return result
 
     manager.can_cache = can_cache

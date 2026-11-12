@@ -66,12 +66,48 @@ def disable_cache_on_transformer(transformer: torch.nn.Module) -> torch.nn.Modul
     logger.info("Disabling cache-dit on %s", type(transformer).__name__)
     target = getattr(transformer, "_sglang_cache_dit_adapter", transformer)
     cache_dit.disable_cache(target)
+    for hook in getattr(transformer, "_sglang_adaptive_rdt_hooks", ()):
+        hook.remove()
+    if hasattr(transformer, "_sglang_adaptive_rdt_hooks"):
+        del transformer._sglang_adaptive_rdt_hooks
     if target is not transformer:
         del transformer._sglang_cache_dit_adapter
     for name in ("_is_parallelized", "_parallelism_config"):
         if hasattr(transformer, name):
             delattr(transformer, name)
     return transformer
+
+
+def _cache_dit_feature_diff(manager, t1, t2, target_group=None, *, check_shape=False):
+    # Adapted from https://github.com/vipshop/cache-dit/blob/main/src/cache_dit/caching/cache_contexts/cache_manager.py#L495-L523
+    condition_thresh = manager.get_important_condition_threshold()
+    if check_shape and t1.shape != t2.shape:
+        # All ranks still enter the reductions and conservatively go exact
+        # if any shard changed shape. Such risk windows cannot calibrate.
+        mean_diff = t1.new_full((), float("inf"))
+        mean_t1 = t1.new_ones(())
+    elif condition_thresh > 0.0:
+        raw_diff = (t1 - t2).abs()
+        token_m_df = raw_diff.mean(dim=-1)
+        token_m_t1 = t1.abs().mean(dim=-1)
+        token_diff = token_m_df / token_m_t1
+        condition = token_diff > condition_thresh
+        if condition.sum() > 0:
+            condition = condition.unsqueeze(-1).expand_as(raw_diff)
+            mean_diff = raw_diff[condition].mean()
+            mean_t1 = t1[condition].abs().mean()
+        else:
+            mean_diff = (t1 - t2).abs().mean()
+            mean_t1 = t1.abs().mean()
+    else:
+        mean_diff = (t1 - t2).abs().mean()
+        mean_t1 = t1.abs().mean()
+
+    if target_group is not None and dist.get_world_size(target_group) > 1:
+        dist.all_reduce(mean_diff, op=dist.ReduceOp.AVG, group=target_group)
+        dist.all_reduce(mean_t1, op=dist.ReduceOp.AVG, group=target_group)
+
+    return mean_diff / mean_t1
 
 
 def _patch_cache_dit_similarity():
@@ -121,48 +157,31 @@ def _patch_cache_dit_similarity():
                 prefix=prefix,
             )
 
-        # Adapted from https://github.com/vipshop/cache-dit/blob/main/src/cache_dit/caching/cache_contexts/cache_manager.py#L495-L523
-        condition_thresh = self.get_important_condition_threshold()
-        if adaptive is not None and t1.shape != t2.shape:
-            # All ranks still enter the reductions and conservatively go exact
-            # if any shard changed shape. Such risk windows cannot calibrate.
-            mean_diff = t1.new_full((), float("inf"))
-            mean_t1 = t1.new_ones(())
-        elif condition_thresh > 0.0:
-            raw_diff = (t1 - t2).abs()
-            token_m_df = raw_diff.mean(dim=-1)
-            token_m_t1 = t1.abs().mean(dim=-1)
-            token_diff = token_m_df / token_m_t1
-            condition = token_diff > condition_thresh
-            if condition.sum() > 0:
-                condition = condition.unsqueeze(-1).expand_as(raw_diff)
-                mean_diff = raw_diff[condition].mean()
-                mean_t1 = t1[condition].abs().mean()
-            else:
-                mean_diff = (t1 - t2).abs().mean()
-                mean_t1 = t1.abs().mean()
-        else:
-            mean_diff = (t1 - t2).abs().mean()
-            mean_t1 = t1.abs().mean()
-
-        if target_group is not None and dist.get_world_size(target_group) > 1:
-            dist.all_reduce(mean_diff, op=dist.ReduceOp.AVG, group=target_group)
-            dist.all_reduce(mean_t1, op=dist.ReduceOp.AVG, group=target_group)
+        difference = _cache_dit_feature_diff(
+            self, t1, t2, target_group, check_shape=adaptive is not None
+        )
 
         if adaptive is None:
-            diff = (mean_diff / mean_t1).item()
+            diff = difference.item()
         else:
-            # Consume RDT at the existing host cache-decision sync point.
-            difference = mean_diff / mean_t1
+            # One existing host decision sync now carries the cumulative risk
+            # and RDT as well as the original feature difference.
+            adaptive.compared = True
             adaptive.add_risk(difference)
-            diff, calibrated = torch.stack((difference, adaptive.rdt)).tolist()
+            decision_risk = torch.where(
+                adaptive.risk_valid, adaptive.risk,
+                adaptive.risk.new_tensor(float("inf")),
+            )
+            diff, risk, calibrated = torch.stack((
+                difference, decision_risk, adaptive.rdt
+            )).tolist()
+            adaptive.budget_triggered = risk < float("inf") and risk >= calibrated
             if not adaptive.shadow:
-                threshold = calibrated
-                self.current_context.cache_config.residual_diff_threshold = threshold
-            elif threshold >= 1.0:
-                # Preserve stock cache-dit's unconditional reuse in shadow.
-                # Active mode deliberately treats 1 as a numeric threshold;
-                # feature differences above were still collected for feedback.
+                self.current_context.cache_config.residual_diff_threshold = calibrated
+                self.add_residual_diff(diff)
+                return risk < calibrated
+            # Shadow retains stock scheduling, including its >=1 sentinel.
+            if threshold >= 1.0:
                 self.add_residual_diff(-1.0)
                 return True
         self.add_residual_diff(diff)
@@ -712,7 +731,10 @@ def enable_cache_on_transformer(
             context_manager._sglang_tp_sp_group = get_dit_group()
 
     if any(cls.__name__ == "MiniMaxH3DiTModel" for cls in type(transformer).__mro__):
-        if enable_adaptive_rdt(transformer, config.residual_diff_threshold, logger):
+        if enable_adaptive_rdt(
+            transformer, config.residual_diff_threshold, logger,
+            feature_difference=_cache_dit_feature_diff,
+        ):
             _patch_cache_dit_similarity()
 
     return transformer
