@@ -12,6 +12,7 @@ from typing import List, Optional
 import torch
 import torch.distributed as dist
 
+from sglang.multimodal_gen.runtime.cache.adaptive_rdt import enable_adaptive_rdt
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_classifier_free_guidance_world_size,
     get_ring_parallel_world_size,
@@ -91,7 +92,8 @@ def _patch_cache_dit_similarity():
         parallelized: bool = False,
         prefix: str = "Fn",
     ) -> bool:
-        if not parallelized:
+        adaptive = getattr(self, "_sglang_adaptive_rdt", None)
+        if not parallelized and adaptive is None:
             return _original_similarity(
                 self,
                 t1,
@@ -107,7 +109,9 @@ def _patch_cache_dit_similarity():
         target_group = tp_sp_group or sp_group or tp_group
 
         # CFG/DP peers are independent; never fall back to the global group
-        if target_group is None or dist.get_world_size(target_group) == 1:
+        if adaptive is None and (
+            target_group is None or dist.get_world_size(target_group) == 1
+        ):
             return _original_similarity(
                 self,
                 t1,
@@ -119,7 +123,12 @@ def _patch_cache_dit_similarity():
 
         # Adapted from https://github.com/vipshop/cache-dit/blob/main/src/cache_dit/caching/cache_contexts/cache_manager.py#L495-L523
         condition_thresh = self.get_important_condition_threshold()
-        if condition_thresh > 0.0:
+        if adaptive is not None and t1.shape != t2.shape:
+            # All ranks still enter the reductions and conservatively go exact
+            # if any shard changed shape. Such risk windows cannot calibrate.
+            mean_diff = t1.new_full((), float("inf"))
+            mean_t1 = t1.new_ones(())
+        elif condition_thresh > 0.0:
             raw_diff = (t1 - t2).abs()
             token_m_df = raw_diff.mean(dim=-1)
             token_m_t1 = t1.abs().mean(dim=-1)
@@ -136,10 +145,20 @@ def _patch_cache_dit_similarity():
             mean_diff = (t1 - t2).abs().mean()
             mean_t1 = t1.abs().mean()
 
-        dist.all_reduce(mean_diff, op=dist.ReduceOp.AVG, group=target_group)
-        dist.all_reduce(mean_t1, op=dist.ReduceOp.AVG, group=target_group)
+        if target_group is not None and dist.get_world_size(target_group) > 1:
+            dist.all_reduce(mean_diff, op=dist.ReduceOp.AVG, group=target_group)
+            dist.all_reduce(mean_t1, op=dist.ReduceOp.AVG, group=target_group)
 
-        diff = (mean_diff / mean_t1).item()
+        if adaptive is None:
+            diff = (mean_diff / mean_t1).item()
+        else:
+            # Consume RDT at the existing host cache-decision sync point.
+            difference = mean_diff / mean_t1
+            adaptive.add_risk(difference)
+            diff, calibrated = torch.stack((difference, adaptive.rdt)).tolist()
+            if not adaptive.shadow:
+                threshold = calibrated
+                self.current_context.cache_config.residual_diff_threshold = threshold
         self.add_residual_diff(diff)
         return diff < threshold
 
@@ -685,6 +704,10 @@ def enable_cache_on_transformer(
         if context_manager is not None:
             # The DiT group spans the CFG ranks (and any TP ranks within them).
             context_manager._sglang_tp_sp_group = get_dit_group()
+
+    if any(cls.__name__ == "MiniMaxH3DiTModel" for cls in type(transformer).__mro__):
+        if enable_adaptive_rdt(transformer, config.residual_diff_threshold, logger):
+            _patch_cache_dit_similarity()
 
     return transformer
 

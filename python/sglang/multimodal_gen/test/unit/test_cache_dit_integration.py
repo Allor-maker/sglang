@@ -128,6 +128,10 @@ def _install_sglang_dependency_stubs():
             pass
 
     logging_utils.init_logger = lambda _name: _FakeLogger()
+    adaptive_rdt = types.ModuleType("sglang.multimodal_gen.runtime.cache.adaptive_rdt")
+    # These tests exercise mount plumbing with Adaptive RDT disabled. The real
+    # controller/opt-out contract has separate CPU tensor coverage.
+    adaptive_rdt.enable_adaptive_rdt = lambda *_args: False
 
     return {
         "sglang": sglang,
@@ -137,6 +141,7 @@ def _install_sglang_dependency_stubs():
         "sglang.multimodal_gen.runtime.distributed.parallel_state": parallel_state,
         "sglang.multimodal_gen.runtime.utils": utils,
         "sglang.multimodal_gen.runtime.utils.logging_utils": logging_utils,
+        adaptive_rdt.__name__: adaptive_rdt,
     }
 
 

@@ -79,6 +79,11 @@ if TYPE_CHECKING:
     SGLANG_CACHE_DIT_BN: int = 0
     SGLANG_CACHE_DIT_WARMUP: int = 4
     SGLANG_CACHE_DIT_RDT: float = 0.24
+    SGLANG_CACHE_DIT_ADAPTIVE_RDT: bool = False
+    SGLANG_CACHE_DIT_ADAPTIVE_RDT_SHADOW: bool = False
+    SGLANG_CACHE_DIT_TARGET_ERROR: float = 0.01
+    SGLANG_CACHE_DIT_RDT_EMA: float = 0.9
+    SGLANG_CACHE_DIT_RDT_PROBE_INTERVAL: int = 16
     SGLANG_CACHE_DIT_MC: int = 3
     SGLANG_CACHE_DIT_TAYLORSEER: bool = False
     SGLANG_CACHE_DIT_TS_ORDER: int = 1
@@ -420,6 +425,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_CACHE_DIT_WARMUP": _lazy_int("SGLANG_CACHE_DIT_WARMUP", 4),
     # Residual difference threshold (DBCache R parameter)
     "SGLANG_CACHE_DIT_RDT": _lazy_float("SGLANG_CACHE_DIT_RDT", 0.24),
+    # Online error/risk calibration (native MiniMax H3; opt-in).
+    "SGLANG_CACHE_DIT_ADAPTIVE_RDT": _lazy_bool("SGLANG_CACHE_DIT_ADAPTIVE_RDT"),
+    "SGLANG_CACHE_DIT_ADAPTIVE_RDT_SHADOW": _lazy_bool(
+        "SGLANG_CACHE_DIT_ADAPTIVE_RDT_SHADOW"
+    ),
+    "SGLANG_CACHE_DIT_TARGET_ERROR": _lazy_float("SGLANG_CACHE_DIT_TARGET_ERROR", 0.01),
+    "SGLANG_CACHE_DIT_RDT_EMA": _lazy_float("SGLANG_CACHE_DIT_RDT_EMA", 0.9),
+    "SGLANG_CACHE_DIT_RDT_PROBE_INTERVAL": _lazy_int(
+        "SGLANG_CACHE_DIT_RDT_PROBE_INTERVAL", 16
+    ),
     # Maximum continuous cached steps (DBCache MC parameter)
     "SGLANG_CACHE_DIT_MC": _lazy_int("SGLANG_CACHE_DIT_MC", 3),
     # Enable TaylorSeer calibrator
