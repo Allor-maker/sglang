@@ -1,10 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Simplified AlignCache-style error/risk calibration for native H3 DBCache.
 
-Risk accumulates adjacent Fn feature motion, normalized by the exact middle
+Risk accumulates adjacent middle-input motion, normalized by the exact middle
 output and scaled by anchor motion gain. Counterfactual output error is measured
-before the exact cache commit. Device
-state is consumed at the existing Python similarity synchronization point.
+before the exact cache commit. Device state is consumed at the existing Python similarity synchronization point.
 """
 
 import math
@@ -103,7 +102,7 @@ class AdaptiveRDT:
         return stats
 
     def add_feature_risk(self, group):
-        """AlignCache-style adjacent motion in DBCache's Fn feature space."""
+        """AlignCache adjacent motion of the actual cached-segment input."""
         feature = self.current_feature
         previous = self.previous_feature
         if previous is None or previous.shape != feature.shape:
@@ -279,7 +278,9 @@ def enable_adaptive_rdt(
     blocks = transformer.blocks
     first = manager.Fn_compute_blocks()
     stop = len(blocks) - manager.Bn_compute_blocks()
-    if not 0 <= first < stop <= len(blocks):
+    if first < 1:
+        raise ValueError("Adaptive RDT input-risk capture requires FN >= 1")
+    if not first < stop <= len(blocks):
         raise ValueError("Adaptive RDT requires a nonempty cached middle segment")
 
     manager._sglang_adaptive_rdt = controller
@@ -287,6 +288,7 @@ def enable_adaptive_rdt(
     original_set_buffer = manager.set_Bn_buffer
     active_context = None
     prediction = predicted_output = actual_output = None
+    routing_input = None
     probe = False
 
     def group():
@@ -301,6 +303,13 @@ def enable_adaptive_rdt(
         last_step = manager.current_context.cache_config.num_inference_steps - 1
         if manager.get_current_step() == last_step:
             controller.flush(logger)
+
+    @torch.compiler.disable
+    def capture_routing_input(_module, _args, output):
+        nonlocal routing_input
+        # The final Fn block runs on exact AND reuse steps, before can_cache.
+        # Clone now: later blocks may update the activation in place.
+        routing_input = output.detach().clone()
 
     @torch.compiler.disable
     def capture_input(_module, args):
@@ -320,6 +329,7 @@ def enable_adaptive_rdt(
 
     hooks = []
     try:
+        hooks.append(blocks[first - 1].register_forward_hook(capture_routing_input))
         hooks.append(blocks[first].register_forward_pre_hook(capture_input))
         hooks.append(blocks[stop - 1].register_forward_hook(capture_output))
     except Exception:
@@ -330,15 +340,17 @@ def enable_adaptive_rdt(
 
     @torch.compiler.disable
     def can_cache(states_tensor, parallelized=False, threshold=None, prefix="Fn"):
-        nonlocal active_context, prediction, predicted_output, actual_output, probe
+        nonlocal active_context, prediction, predicted_output, actual_output, probe, routing_input
         context = manager.current_context
         if context is not active_context:
             controller.reset()
             context.cache_config.residual_diff_threshold = initial_rdt
             active_context = context
         controller.initialize(states_tensor)
-        factor = manager.get_downsample_factor()
-        controller.current_feature = states_tensor[..., ::factor].detach().clone()
+        if routing_input is None:
+            raise RuntimeError("Adaptive RDT did not capture the current middle input")
+        controller.current_feature = routing_input
+        routing_input = None
         controller.error = controller.ratio = controller.step_risk = None
         controller.compared = controller.budget_triggered = False
         controller.feedback_eligible = False

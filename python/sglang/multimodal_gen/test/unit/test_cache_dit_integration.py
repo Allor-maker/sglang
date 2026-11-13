@@ -380,7 +380,7 @@ class TestBuildCustomBlockAdapter(unittest.TestCase):
             register_forward_hook=Mock(return_value=Mock()),
         )
         transformer = types.SimpleNamespace(
-            blocks=[object(), native_block, object()],
+            blocks=[types.SimpleNamespace(register_forward_hook=Mock(return_value=Mock())), native_block, object()],
             _context_manager=manager,
             _context_names=["h3"],
         )
@@ -393,7 +393,7 @@ class TestBuildCustomBlockAdapter(unittest.TestCase):
             spec.loader.exec_module(module)
             self.assertTrue(module.enable_adaptive_rdt(transformer, 0.5, Mock()))
         self.assertIs(transformer.blocks[1], native_block)
-        self.assertEqual(len(transformer._sglang_adaptive_rdt_hooks), 2)
+        self.assertEqual(len(transformer._sglang_adaptive_rdt_hooks), 3)
         self.assertIsNot(manager.can_cache, original_decide)
         self.assertIsNot(manager.set_Bn_buffer, original_commit)
         self.assertEqual(manager._sglang_adaptive_rdt.initial_rdt, 0.5)
