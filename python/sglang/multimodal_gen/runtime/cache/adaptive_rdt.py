@@ -6,6 +6,7 @@ output and scaled by anchor motion gain. Counterfactual output error is measured
 before the exact cache commit. Device state is consumed at the existing Python similarity synchronization point.
 """
 
+import copy
 import math
 
 import torch
@@ -68,6 +69,7 @@ class AdaptiveRDT:
         self.output_scale = None
         self.calibrated = None
         self.feedback_attempts = 0
+        self.warmup_history = None
 
     def initialize(self, reference):
         if self.rdt is None:
@@ -144,15 +146,17 @@ class AdaptiveRDT:
         self.previous_feature = feature
         self.anchor_output = actual.detach().clone() if actual is not None else None
 
-    def update(self, error):
+    def update(self, error, *, risk=None, risk_valid=None):
         """Calibrate E/B, leaving EMA and RDT unchanged for invalid windows."""
+        risk = self.risk if risk is None else risk
+        risk_valid = self.risk_valid if risk_valid is None else risk_valid
         valid = (
-            self.risk_valid
-            & (self.risk > self.epsilon)
+            risk_valid
+            & (risk > self.epsilon)
             & torch.isfinite(error)
             & (error >= 0)
         )
-        ratio = (error / (self.risk + self.epsilon)).clamp(
+        ratio = (error / (risk + self.epsilon)).clamp(
             self.min_ratio, self.max_ratio
         )
         ratio = torch.nan_to_num(ratio, nan=self.max_ratio)
@@ -173,7 +177,7 @@ class AdaptiveRDT:
         self.error = torch.where(valid, error, float("nan"))
         self.ratio = torch.where(valid, ratio, float("nan"))
 
-    def observe(self, prediction, actual, group):
+    def observe(self, prediction, actual, group, *, risk=None, risk_valid=None):
         # E is relative MSE of the actual cached-segment output.
         if actual is None:
             moments = self.rdt.new_tensor([float("nan"), 1.0])
@@ -186,7 +190,10 @@ class AdaptiveRDT:
             moments = torch.stack((delta.square().sum(), actual.square().sum()))
         if group is not None and dist.get_world_size(group) > 1:
             dist.all_reduce(moments, op=dist.ReduceOp.SUM, group=group)
-        self.update(moments[0] / moments[1].clamp_min(self.epsilon))
+        self.update(
+            moments[0] / moments[1].clamp_min(self.epsilon),
+            risk=risk, risk_valid=risk_valid,
+        )
         self.feedback_attempts += 1
 
     def should_probe(self, step):
@@ -233,6 +240,46 @@ class AdaptiveRDT:
                 risk, error, ratio, ema, rdt, desired,
             )
         self.records.clear()
+
+
+class WarmupCalibration:
+    """Frozen first-exact predictor; later warmup exacts are observations only."""
+
+    def __init__(self, controller, residual, step, state=None):
+        self.anchor_step = step
+        self.residual = residual.detach().clone()
+        self.predictor = None
+        if state is not None:
+            # Reuse Cache-DiT's TaylorSeer implementation without sharing buffers.
+            self.predictor = copy.copy(state)
+            self.predictor.state = {
+                name: [value.detach().clone() if value is not None else None
+                       for value in values]
+                for name, values in state.state.items()
+            }
+            self.predictor_step = state.current_step
+        self.previous_input = controller.current_feature
+        self.gain = controller.gain.clone()
+        self.output_scale = controller.output_scale.clone()
+        self.risk = torch.zeros_like(controller.rdt)
+        self.valid = controller.rdt.new_tensor(True, dtype=torch.bool)
+
+    def predict(self, controller, step, group):
+        current = controller.current_feature
+        if current.shape == self.previous_input.shape:
+            delta = (current.float() - self.previous_input.float()).abs().mean()
+        else:
+            delta = self.risk.new_tensor(float("inf"))
+        delta = controller.reduce_means([delta], group)[0]
+        increment = self.gain * delta / self.output_scale.clamp_min(controller.epsilon)
+        self.valid = self.valid & torch.isfinite(increment) & (increment >= 0)
+        self.risk = self.risk + torch.where(torch.isfinite(increment), increment, 0.0)
+        self.valid = self.valid & torch.isfinite(self.risk)
+        self.previous_input = current
+        if self.predictor is None:
+            return self.residual
+        self.predictor.current_step = self.predictor_step + step - self.anchor_step
+        return self.predictor.approximate()
 
 
 def enable_adaptive_rdt(
@@ -289,7 +336,7 @@ def enable_adaptive_rdt(
     active_context = None
     prediction = predicted_output = actual_output = None
     routing_input = None
-    probe = False
+    probe = warmup = warmup_probe = False
 
     def group():
         return (
@@ -340,7 +387,8 @@ def enable_adaptive_rdt(
 
     @torch.compiler.disable
     def can_cache(states_tensor, parallelized=False, threshold=None, prefix="Fn"):
-        nonlocal active_context, prediction, predicted_output, actual_output, probe, routing_input
+        nonlocal active_context, prediction, predicted_output, actual_output
+        nonlocal probe, routing_input, warmup, warmup_probe
         context = manager.current_context
         if context is not active_context:
             controller.reset()
@@ -357,6 +405,9 @@ def enable_adaptive_rdt(
         prediction = predicted_output = actual_output = None
         probe = False
         warmup = manager.is_in_warmup()
+        warmup_probe = warmup and controller.warmup_history is not None
+        if not warmup:
+            controller.warmup_history = None
         mask_due = (
             manager.is_steps_computation_mask_enabled()
             and manager.is_in_full_compute_steps()
@@ -404,9 +455,15 @@ def enable_adaptive_rdt(
             and controller.has_history
             and controller.risk_samples > 0
         )
+        if warmup_probe:
+            controller.reason = "warmup_probe"
+            controller.feedback_eligible = True
+            prediction = controller.warmup_history.predict(
+                controller, manager.get_current_step(), group()
+            )
         if reuse:
             record(exact=False)
-        elif controller.feedback_eligible:
+        elif controller.feedback_eligible and not warmup_probe:
             cache_prefix = prefix.rsplit("_Fn_", 1)[0]
             prediction = manager.get_Bn_buffer(prefix=f"{cache_prefix}_Bn_residual")
         return reuse
@@ -423,13 +480,29 @@ def enable_adaptive_rdt(
                 controller.reason += "_output_unavailable"
             if predicted_output is not None and predicted_output.shape != measured.shape:
                 predicted_output = None
-            controller.observe(predicted_output, measured, group())
+            history = controller.warmup_history if warmup_probe else None
+            controller.observe(
+                predicted_output, measured, group(),
+                risk=history.risk if history is not None else None,
+                risk_valid=history.valid if history is not None else None,
+            )
             controller.last_feedback_step = manager.get_current_step()
         # Commit the true residual/TaylorSeer derivatives only after measuring
         # the counterfactual middle output against the real output.
         controller.update_motion(actual_output, group())
         result = original_set_buffer(buffer, prefix=prefix)
+        if warmup and controller.warmup_history is None:
+            state = None
+            if manager.is_calibrator_enabled():
+                calibrator, _ = manager.get_calibrator()
+                if calibrator is not None:
+                    state = calibrator.states.get(prefix)
+            controller.warmup_history = WarmupCalibration(
+                controller, buffer, manager.get_current_step(), state
+            )
         controller.anchor(manager.get_current_step())
+        if warmup_probe:
+            controller.step_risk = controller.warmup_history.risk
         record(exact=True)
         prediction = predicted_output = actual_output = None
         return result
