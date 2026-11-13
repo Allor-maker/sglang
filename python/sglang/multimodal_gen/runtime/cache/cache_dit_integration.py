@@ -167,7 +167,11 @@ def _patch_cache_dit_similarity():
             # One existing host decision sync now carries the cumulative risk
             # and RDT as well as the original feature difference.
             adaptive.compared = True
-            adaptive.add_risk(difference)
+            if adaptive.current_feature is None:
+                # Standalone similarity users have no forward lifecycle.
+                adaptive.add_risk(difference)
+            else:
+                adaptive.add_feature_risk(target_group)
             decision_risk = torch.where(
                 adaptive.risk_valid, adaptive.risk,
                 adaptive.risk.new_tensor(float("inf")),

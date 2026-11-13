@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Simplified AlignCache-style error/risk calibration for native H3 DBCache.
 
-Risk uses the feature differences actually evaluated by DBCache. Error is
-measured on counterfactual residuals before the exact cache commit. Device
+Risk accumulates adjacent Fn feature motion, normalized by the exact middle
+output and scaled by anchor motion gain. Counterfactual output error is measured
+before the exact cache commit. Device
 state is consumed at the existing Python similarity synchronization point.
 """
 
@@ -60,6 +61,14 @@ class AdaptiveRDT:
         self.feedback_eligible = False
         self.reason = "bootstrap"
         self.records = []
+        self.previous_feature = None
+        self.current_feature = None
+        self.anchor_feature = None
+        self.anchor_output = None
+        self.gain = None
+        self.output_scale = None
+        self.calibrated = None
+        self.feedback_attempts = 0
 
     def initialize(self, reference):
         if self.rdt is None:
@@ -67,6 +76,9 @@ class AdaptiveRDT:
             self.desired_rdt = self.rdt
             # E/B=1 means the proxy is calibrated: scale=1, RDT=base RDT.
             self.ema = torch.ones_like(self.rdt)
+            self.gain = torch.ones_like(self.rdt)
+            self.output_scale = torch.ones_like(self.rdt)
+            self.calibrated = self.rdt.new_tensor(False, dtype=torch.bool)
             self.clear_risk()
 
     def clear_risk(self):
@@ -83,6 +95,56 @@ class AdaptiveRDT:
         self.risk_valid = self.risk_valid & torch.isfinite(self.risk)
         self.risk_samples += 1
 
+    @staticmethod
+    def reduce_means(values, group):
+        stats = torch.stack(values)
+        if group is not None and dist.get_world_size(group) > 1:
+            dist.all_reduce(stats, op=dist.ReduceOp.AVG, group=group)
+        return stats
+
+    def add_feature_risk(self, group):
+        """AlignCache-style adjacent motion in DBCache's Fn feature space."""
+        feature = self.current_feature
+        previous = self.previous_feature
+        if previous is None or previous.shape != feature.shape:
+            delta = feature.new_tensor(float("inf"), dtype=torch.float32)
+        else:
+            delta = (feature.float() - previous.float()).abs().mean()
+        delta = self.reduce_means([delta], group)[0]
+        self.add_risk(self.gain * delta / self.output_scale.clamp_min(self.epsilon))
+        self.previous_feature = feature
+
+    def update_motion(self, actual, group):
+        # Fixed-size FP32 collectives, including invalid/missing local history.
+        feature = self.current_feature
+        invalid = self.rdt.new_tensor(float("nan"))
+        scale = actual.detach().float().abs().mean() if actual is not None else invalid
+        pair = (
+            actual is not None and self.anchor_output is not None
+            and self.anchor_output.shape == actual.shape
+            and self.anchor_feature.shape == feature.shape
+        )
+        output_motion = (
+            (actual.detach().float() - self.anchor_output.float()).abs().mean()
+            if pair else invalid
+        )
+        input_motion = (
+            (feature.float() - self.anchor_feature.float()).abs().mean()
+            if pair else invalid
+        )
+        stats = self.reduce_means([scale, output_motion, input_motion], group)
+        self.output_scale = torch.where(
+            torch.isfinite(stats[0]) & (stats[0] > self.epsilon),
+            stats[0], self.output_scale,
+        )
+        candidate = stats[1] / stats[2].clamp_min(self.epsilon)
+        # Degenerate anchors do not prove that a TS forecast has zero risk.
+        valid = (stats[2] > self.epsilon) & torch.isfinite(candidate) & (candidate > 0)
+        self.gain = torch.where(valid, candidate, self.gain)
+        self.anchor_feature = feature
+        self.previous_feature = feature
+        self.anchor_output = actual.detach().clone() if actual is not None else None
+
     def update(self, error):
         """Calibrate E/B, leaving EMA and RDT unchanged for invalid windows."""
         valid = (
@@ -98,7 +160,10 @@ class AdaptiveRDT:
         candidate = (self.decay * self.ema + (1 - self.decay) * ratio).clamp(
             self.min_ratio, self.max_ratio
         )
+        # Do not dilute the first observation with an arbitrary neutral prior.
+        candidate = torch.where(self.calibrated, candidate, ratio)
         self.ema = torch.where(valid, candidate, self.ema)
+        self.calibrated = self.calibrated | valid
         desired = (self.initial_rdt / self.ema).clamp(self.min_rdt, self.max_rdt)
         self.desired_rdt = desired
         limited = desired.clamp(
@@ -115,7 +180,7 @@ class AdaptiveRDT:
             moments = self.rdt.new_tensor([float("nan"), 1.0])
         elif prediction is None:
             # Participate even if one shard has invalid prediction history.
-            moments = actual.new_tensor([float("nan"), 1.0])
+            moments = self.rdt.new_tensor([float("nan"), 1.0])
         else:
             actual = actual.detach().float()
             delta = prediction.detach().float() - actual
@@ -123,13 +188,17 @@ class AdaptiveRDT:
         if group is not None and dist.get_world_size(group) > 1:
             dist.all_reduce(moments, op=dist.ReduceOp.SUM, group=group)
         self.update(moments[0] / moments[1].clamp_min(self.epsilon))
+        self.feedback_attempts += 1
 
     def should_probe(self, step):
         return (
             not self.shadow
             and self.has_history
             and self.risk_samples > 0
-            and step - self.last_feedback_step >= self.probe_interval
+            and (
+                (self.feedback_attempts == 0 and self.risk_samples >= 2)
+                or step - self.last_feedback_step >= self.probe_interval
+            )
         )
 
     def anchor(self, step):
@@ -170,7 +239,7 @@ class AdaptiveRDT:
 def enable_adaptive_rdt(
     transformer, initial_rdt, logger, *, feature_difference=None
 ):
-    """Route on cumulative DBCache risk; calibrate budget/probe exacts only."""
+    """Route on accumulated motion risk; calibrate before TS cache commits."""
     from sglang.multimodal_gen import envs
 
     shadow = envs.SGLANG_CACHE_DIT_ADAPTIVE_RDT_SHADOW
@@ -247,8 +316,7 @@ def enable_adaptive_rdt(
     @torch.compiler.disable
     def capture_output(_module, _args, output):
         nonlocal actual_output
-        if controller.feedback_eligible:
-            actual_output = output.detach()
+        actual_output = output.detach()
 
     hooks = []
     try:
@@ -269,6 +337,8 @@ def enable_adaptive_rdt(
             context.cache_config.residual_diff_threshold = initial_rdt
             active_context = context
         controller.initialize(states_tensor)
+        factor = manager.get_downsample_factor()
+        controller.current_feature = states_tensor[..., ::factor].detach().clone()
         controller.error = controller.ratio = controller.step_risk = None
         controller.compared = controller.budget_triggered = False
         controller.feedback_eligible = False
@@ -301,26 +371,9 @@ def enable_adaptive_rdt(
         else:
             controller.reason = "guard" if controller.has_history else "bootstrap"
 
-        # Early guards (notably MC) bypass similarity. Still include the exact
-        # endpoint in B using the same feature metric, without a host transfer
-        # and without changing the guard's decision or DBCache statistics.
+        # Include early-exact endpoints in the same accumulated motion risk.
         if not controller.compared and not warmup and controller.has_history:
-            previous = manager.get_Fn_buffer(prefix)
-            if previous is not None:
-                current = states_tensor
-                factor = manager.get_downsample_factor()
-                if factor > 1:
-                    current = current[..., ::factor].contiguous()
-                diff_fn = feature_difference
-                if diff_fn is None:
-                    from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
-                        _cache_dit_feature_diff,
-                    )
-
-                    diff_fn = _cache_dit_feature_diff
-                controller.add_risk(
-                    diff_fn(manager, previous, current, group(), check_shape=True)
-                )
+            controller.add_feature_risk(group())
 
         # Count time since feedback, not since any anchor: frequent MC exacts
         # must not prevent deliberately scheduled calibration probes forever.
@@ -335,7 +388,7 @@ def enable_adaptive_rdt(
         controller.feedback_eligible = (
             not reuse
             and not warmup
-            and controller.reason in ("budget", "probe")
+            and controller.reason in ("budget", "probe", "mc")
             and controller.has_history
             and controller.risk_samples > 0
         )
@@ -362,6 +415,7 @@ def enable_adaptive_rdt(
             controller.last_feedback_step = manager.get_current_step()
         # Commit the true residual/TaylorSeer derivatives only after measuring
         # the counterfactual middle output against the real output.
+        controller.update_motion(actual_output, group())
         result = original_set_buffer(buffer, prefix=prefix)
         controller.anchor(manager.get_current_step())
         record(exact=True)
