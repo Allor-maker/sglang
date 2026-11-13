@@ -754,12 +754,17 @@ def enable_cache_on_transformer(
             context_manager._sglang_tp_sp_group = get_dit_group()
 
     if any(
-        cls.__name__ in ("MiniMaxH3DiTModel", "WanTransformer3DModel")
+        cls.__name__ in ("MiniMaxH3DiTModel", "WanTransformer3DModel", "Kandinsky6Transformer3DModel")
         for cls in type(transformer).__mro__
     ):
         if enable_adaptive_rdt(
             transformer, config.residual_diff_threshold, logger,
             feature_difference=_cache_dit_feature_diff,
+            blocks=custom_adapter.blocks if custom_adapter is not None else None,
+            joint_streams=any(
+                cls.__name__ == "Kandinsky6Transformer3DModel"
+                for cls in type(transformer).__mro__
+            ) and transformer.config.is_multimodal,
         ):
             _patch_cache_dit_similarity()
 

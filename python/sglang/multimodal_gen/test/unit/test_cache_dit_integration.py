@@ -673,6 +673,22 @@ class TestCalibratorSelection(unittest.TestCase):
                         self.assertIs(target, transformer)
                     self.assertIs(module.enable_adaptive_rdt.call_args.args[0], transformer)
 
+    def test_adaptive_kandinsky6_uses_visual_blocks_and_joint_mode(self):
+        for multimodal in (False, True):
+            with self.subTest(multimodal=multimodal):
+                module = _import_module_with_stub()
+                transformer = _make_transformer("Kandinsky6Transformer3DModel")
+                transformer.config = types.SimpleNamespace(is_multimodal=multimodal)
+                transformer.visual_transformer_blocks = ["block_0"]
+                module.enable_adaptive_rdt = Mock(return_value=True)
+                module._patch_cache_dit_similarity = Mock()
+                module.enable_cache_on_transformer(transformer, self._config(module))
+                kwargs = module.enable_adaptive_rdt.call_args.kwargs
+                self.assertIs(kwargs["blocks"], transformer.visual_transformer_blocks)
+                self.assertIs(kwargs["joint_streams"], multimodal)
+                adapter = module.cache_dit.enable_calls[0]["target"]
+                self.assertEqual(adapter.forward_pattern, "Pattern_0" if multimodal else "Pattern_2")
+
     def test_adaptive_wan_dual_mount_keeps_expert_thresholds(self):
         module = _import_module_with_stub()
         module.ParamsModifier = types.SimpleNamespace

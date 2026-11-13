@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Simplified AlignCache-style error/risk calibration for native H3/Wan DBCache.
+"""Simplified AlignCache-style error/risk calibration for native diffusion DBCache.
 
 Risk accumulates adjacent middle-input motion, normalized by the exact middle
 output and scaled by anchor motion gain. Counterfactual output error is measured
@@ -13,6 +13,7 @@ import torch.distributed as dist
 
 
 class AdaptiveRDT:
+    metric = "middle_output_relative_mse"
     min_rdt = 0.01
     max_rdt = 1.0
     max_decrease = 0.50
@@ -229,17 +230,77 @@ class AdaptiveRDT:
             risk, error, ratio, ema, rdt, desired = scalars
             logger.info(
                 "Adaptive RDT step=%d mode=%s shadow=%s probe=%s "
-                "reason=%s feedback_eligible=%s metric=middle_output_relative_mse "
+                "reason=%s feedback_eligible=%s metric=%s "
                 "risk=%g error=%g ratio=%g ratio_ema=%g rdt=%g rdt_desired=%g "
                 "context=%s branch=%s",
-                step, "exact" if exact else "reuse", self.shadow, probe, reason, feedback,
+                step, "exact" if exact else "reuse", self.shadow, probe, reason, feedback, self.metric,
                 risk, error, ratio, ema, rdt, desired, self.context_name, self.branch,
             )
         self.records.clear()
 
 
+class JointAdaptiveRDT(AdaptiveRDT):
+    """Joint routing with independent video/audio motion and max relative error."""
+
+    metric = "max_video_audio_relative_mse"
+
+    def __init__(self, *args, **kwargs):
+        self.streams = ()
+        super().__init__(*args, **kwargs)
+        self.streams = tuple(AdaptiveRDT(*args, **kwargs) for _ in range(2))
+
+    def reset(self):
+        super().reset()
+        for stream in self.streams:
+            stream.reset()
+
+    def initialize(self, reference):
+        super().initialize(reference)
+        for stream in self.streams:
+            stream.initialize(reference)
+
+    def clear_risk(self):
+        super().clear_risk()
+        for stream in self.streams:
+            if stream.rdt is not None:
+                stream.clear_risk()
+
+    def add_feature_risk(self, group):
+        for stream, feature in zip(self.streams, self.current_feature):
+            stream.current_feature = feature
+            stream.add_feature_risk(group)
+        self.risk = torch.stack([stream.risk for stream in self.streams]).max()
+        self.risk_valid = self.streams[0].risk_valid & self.streams[1].risk_valid
+        self.risk_samples += 1
+
+    def update_motion(self, actual, group):
+        outputs = actual if actual is not None else (None, None)
+        for stream, feature, output in zip(self.streams, self.current_feature, outputs):
+            stream.current_feature = feature
+            stream.update_motion(output, group)
+
+    def observe(self, prediction, actual, group):
+        # Global FP32 moments per modality. A large video tensor must not hide
+        # audio error; do not combine modalities by energy-weighted averaging.
+        predictions = prediction if prediction is not None else (None, None)
+        outputs = actual if actual is not None else (None, None)
+        moments = []
+        for predicted, output in zip(predictions, outputs):
+            if predicted is None or output is None:
+                moments.append(self.rdt.new_tensor([float("nan"), 1.0]))
+            else:
+                output = output.detach().float()
+                delta = predicted.detach().float() - output
+                moments.append(torch.stack((delta.square().sum(), output.square().sum())))
+        moments = torch.stack(moments)
+        if group is not None and dist.get_world_size(group) > 1:
+            dist.all_reduce(moments, op=dist.ReduceOp.SUM, group=group)
+        self.update((moments[:, 0] / moments[:, 1].clamp_min(self.epsilon)).max())
+        self.feedback_attempts += 1
+
+
 def enable_adaptive_rdt(
-    transformer, initial_rdt, logger, *, feature_difference=None
+    transformer, initial_rdt, logger, *, feature_difference=None, blocks=None, joint_streams=False
 ):
     """Route on accumulated motion risk; calibrate before TS cache commits."""
     from sglang.multimodal_gen import envs
@@ -248,7 +309,8 @@ def enable_adaptive_rdt(
     if not envs.SGLANG_CACHE_DIT_ADAPTIVE_RDT and not shadow:
         return False
 
-    controller = AdaptiveRDT(
+    controller_type = JointAdaptiveRDT if joint_streams else AdaptiveRDT
+    controller = controller_type(
         initial_rdt,
         envs.SGLANG_CACHE_DIT_RDT_EMA,
         shadow=shadow,
@@ -277,10 +339,12 @@ def enable_adaptive_rdt(
             raise ValueError("Adaptive RDT supports only no calibrator or TaylorSeer")
     if not manager.is_cache_residual():
         raise ValueError("Adaptive RDT requires residual caching")
+    if joint_streams and not manager.is_encoder_cache_residual():
+        raise ValueError("Adaptive RDT requires residual caching for both modalities")
     separate_cfg = manager.enable_separate_cfg()
     controllers = [controller]
     if separate_cfg:
-        controllers.append(AdaptiveRDT(
+        controllers.append(controller_type(
             initial_rdt, envs.SGLANG_CACHE_DIT_RDT_EMA,
             shadow=shadow, probe_interval=envs.SGLANG_CACHE_DIT_RDT_PROBE_INTERVAL,
         ))
@@ -288,7 +352,7 @@ def enable_adaptive_rdt(
         state.context_name = context_names[0]
         state.branch = "cfg" if index else "main"
 
-    blocks = transformer.blocks
+    blocks = transformer.blocks if blocks is None else blocks
     first = manager.Fn_compute_blocks()
     stop = len(blocks) - manager.Bn_compute_blocks()
     if first < 1:
@@ -328,23 +392,30 @@ def enable_adaptive_rdt(
         nonlocal routing_input
         # The final Fn block runs on exact AND reuse steps, before can_cache.
         # Clone now: later blocks may update the activation in place.
-        routing_input = output.detach().clone()
+        routing_input = (
+            tuple(value.detach().clone() for value in output)
+            if joint_streams else output.detach().clone()
+        )
 
     @torch.compiler.disable
     def capture_input(_module, args):
         nonlocal prediction, predicted_output
         if controller.feedback_eligible and prediction is not None:
-            hidden_states = args[0]
-            if prediction.shape == hidden_states.shape:
-                # Exactly the hypothetical residual reuse performed by
-                # Pattern_3.apply_cache, on the *current* middle input.
-                predicted_output = prediction + hidden_states
+            if joint_streams:
+                if all(p is not None and p.shape == x.shape for p, x in zip(prediction, args[:2])):
+                    predicted_output = tuple(p + x for p, x in zip(prediction, args[:2]))
+            else:
+                hidden_states = args[0]
+                if prediction.shape == hidden_states.shape:
+                    predicted_output = prediction + hidden_states
             prediction = None
 
     @torch.compiler.disable
     def capture_output(_module, _args, output):
         nonlocal actual_output
-        actual_output = output.detach()
+        actual_output = (
+            tuple(value.detach() for value in output) if joint_streams else output.detach()
+        )
 
     hooks = []
     try:
@@ -441,7 +512,10 @@ def enable_adaptive_rdt(
             record(exact=False)
         elif controller.feedback_eligible:
             cache_prefix = prefix.rsplit("_Fn_", 1)[0]
-            prediction = manager.get_Bn_buffer(prefix=f"{cache_prefix}_Bn_residual")
+            cache_name = f"{cache_prefix}_Bn_residual"
+            prediction = manager.get_Bn_buffer(prefix=cache_name)
+            if joint_streams:
+                prediction = (prediction, manager.get_Bn_encoder_buffer(prefix=cache_name))
         return reuse
 
     @torch.compiler.disable
@@ -456,8 +530,11 @@ def enable_adaptive_rdt(
                 # ranks and cannot update EMA. Never substitute residual MSE.
                 predicted_output = None
                 controller.reason += "_output_unavailable"
-            if predicted_output is not None and predicted_output.shape != measured.shape:
-                predicted_output = None
+            if predicted_output is not None:
+                predictions = predicted_output if joint_streams else (predicted_output,)
+                outputs = measured if joint_streams else (measured,)
+                if any(p.shape != output.shape for p, output in zip(predictions, outputs)):
+                    predicted_output = None
             controller.observe(predicted_output, measured, group())
             controller.last_feedback_step = manager.get_current_step()
         # Commit the true residual/TaylorSeer derivatives only after measuring
