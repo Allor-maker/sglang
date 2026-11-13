@@ -646,6 +646,54 @@ class TestCalibratorSelection(unittest.TestCase):
                 adapter = module.cache_dit.enable_calls[0]["target"]
                 self.assertEqual(adapter.has_separate_cfg, runtime_flag)
 
+    def test_adaptive_wan_single_adapter_uses_runtime_cfg(self):
+        for enabled in (False, True):
+            for separate_cfg in (False, True):
+                with self.subTest(enabled=enabled, separate_cfg=separate_cfg):
+                    module = _import_module_with_stub()
+                    transformer = _make_transformer("WanTransformer3DModel")
+                    transformer.blocks = ["block_0"]
+                    dependencies = _install_sglang_dependency_stubs()
+                    dependencies["sglang.multimodal_gen"].envs = types.SimpleNamespace(
+                        SGLANG_CACHE_DIT_ADAPTIVE_RDT=enabled,
+                        SGLANG_CACHE_DIT_ADAPTIVE_RDT_SHADOW=False,
+                    )
+                    module.enable_adaptive_rdt = Mock(return_value=enabled)
+                    module._patch_cache_dit_similarity = Mock()
+                    with patch.dict(sys.modules, dependencies):
+                        module.enable_cache_on_transformer(
+                            transformer, self._config(module), has_separate_cfg=separate_cfg
+                        )
+                    target = module.cache_dit.enable_calls[0]["target"]
+                    if enabled:
+                        self.assertIs(target.transformer, transformer)
+                        self.assertEqual(target.forward_pattern, module.ForwardPattern.Pattern_2)
+                        self.assertEqual(target.has_separate_cfg, separate_cfg)
+                    else:
+                        self.assertIs(target, transformer)
+                    self.assertIs(module.enable_adaptive_rdt.call_args.args[0], transformer)
+
+    def test_adaptive_wan_dual_mount_keeps_expert_thresholds(self):
+        module = _import_module_with_stub()
+        module.ParamsModifier = types.SimpleNamespace
+        high = _make_transformer("WanTransformer3DModel")
+        low = _make_transformer("WanTransformer3DModel")
+        high.blocks = low.blocks = ["block_0"]
+        module.enable_adaptive_rdt = Mock(return_value=True)
+        module._patch_cache_dit_similarity = Mock()
+        module.enable_cache_on_dual_transformer(
+            high, low,
+            self._config(module, residual_diff_threshold=0.3),
+            self._config(module, residual_diff_threshold=0.6),
+        )
+        calls = module.enable_adaptive_rdt.call_args_list
+        self.assertEqual(len(calls), 2)
+        self.assertIs(calls[0].args[0], high)
+        self.assertEqual(calls[0].args[1], 0.3)
+        self.assertIs(calls[1].args[0], low)
+        self.assertEqual(calls[1].args[1], 0.6)
+
+
 
 class TestCacheDitLegacyFallback(unittest.TestCase):
     """cache-dit < 1.5.0 (CI base jobs ship 1.3.0): fallback import + DMD guard."""

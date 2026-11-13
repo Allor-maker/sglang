@@ -70,6 +70,10 @@ def disable_cache_on_transformer(transformer: torch.nn.Module) -> torch.nn.Modul
         hook.remove()
     if hasattr(transformer, "_sglang_adaptive_rdt_hooks"):
         del transformer._sglang_adaptive_rdt_hooks
+    if hasattr(transformer, "_sglang_adaptive_rdt_controllers"):
+        for controller in transformer._sglang_adaptive_rdt_controllers:
+            controller.reset()
+        del transformer._sglang_adaptive_rdt_controllers
     if target is not transformer:
         del transformer._sglang_cache_dit_adapter
     for name in ("_is_parallelized", "_parallelism_config"):
@@ -129,6 +133,10 @@ def _patch_cache_dit_similarity():
         prefix: str = "Fn",
     ) -> bool:
         adaptive = getattr(self, "_sglang_adaptive_rdt", None)
+        if adaptive is not None and adaptive.context_name != getattr(
+            self.current_context, "name", adaptive.context_name
+        ):
+            adaptive = None
         if not parallelized and adaptive is None:
             return _original_similarity(
                 self,
@@ -619,6 +627,17 @@ def enable_cache_on_transformer(
     custom_adapter = _build_custom_block_adapter(
         transformer, has_separate_cfg=has_separate_cfg
     )
+    if any(cls.__name__ == "WanTransformer3DModel" for cls in type(transformer).__mro__):
+        from sglang.multimodal_gen import envs
+
+        if envs.SGLANG_CACHE_DIT_ADAPTIVE_RDT or envs.SGLANG_CACHE_DIT_ADAPTIVE_RDT_SHADOW:
+            # Native Wan is Pattern_2 (static text input, tensor output).
+            # Honor actual CFG execution, including one call/rank in CFG parallel.
+            custom_adapter = BlockAdapter(
+                transformer=transformer, blocks=transformer.blocks,
+                forward_pattern=ForwardPattern.Pattern_2,
+                has_separate_cfg=has_separate_cfg,
+            )
     if custom_adapter is None and not BlockAdapterRegister.is_supported(transformer):
         transformer_cls_name = transformer.__class__.__name__
         raise ValueError(
@@ -734,7 +753,10 @@ def enable_cache_on_transformer(
             # The DiT group spans the CFG ranks (and any TP ranks within them).
             context_manager._sglang_tp_sp_group = get_dit_group()
 
-    if any(cls.__name__ == "MiniMaxH3DiTModel" for cls in type(transformer).__mro__):
+    if any(
+        cls.__name__ in ("MiniMaxH3DiTModel", "WanTransformer3DModel")
+        for cls in type(transformer).__mro__
+    ):
         if enable_adaptive_rdt(
             transformer, config.residual_diff_threshold, logger,
             feature_difference=_cache_dit_feature_diff,
@@ -952,6 +974,14 @@ def enable_cache_on_dual_transformer(
                     except Exception:
                         tp_sp_group = None
                 context_manager._sglang_tp_sp_group = tp_sp_group
+
+    if model_name == "wan2.2":
+        for model, config in ((transformer, primary_config), (transformer_2, secondary_config)):
+            if enable_adaptive_rdt(
+                model, config.residual_diff_threshold, logger,
+                feature_difference=_cache_dit_feature_diff,
+            ):
+                _patch_cache_dit_similarity()
 
     return transformer, transformer_2
 

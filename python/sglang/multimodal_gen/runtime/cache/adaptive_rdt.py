@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Simplified AlignCache-style error/risk calibration for native H3 DBCache.
+"""Simplified AlignCache-style error/risk calibration for native H3/Wan DBCache.
 
 Risk accumulates adjacent middle-input motion, normalized by the exact middle
 output and scaled by anchor motion gain. Counterfactual output error is measured
@@ -36,6 +36,8 @@ class AdaptiveRDT:
             raise ValueError("SGLANG_CACHE_DIT_RDT_EMA must be in [0, 1)")
         if probe_interval < 2:
             raise ValueError("SGLANG_CACHE_DIT_RDT_PROBE_INTERVAL must be >= 2")
+        self.context_name = ""
+        self.branch = "main"
         self.initial_rdt = initial_rdt
         self.decay = decay
         self.shadow = shadow
@@ -228,9 +230,10 @@ class AdaptiveRDT:
             logger.info(
                 "Adaptive RDT step=%d mode=%s shadow=%s probe=%s "
                 "reason=%s feedback_eligible=%s metric=middle_output_relative_mse "
-                "risk=%g error=%g ratio=%g ratio_ema=%g rdt=%g rdt_desired=%g",
+                "risk=%g error=%g ratio=%g ratio_ema=%g rdt=%g rdt_desired=%g "
+                "context=%s branch=%s",
                 step, "exact" if exact else "reuse", self.shadow, probe, reason, feedback,
-                risk, error, ratio, ema, rdt, desired,
+                risk, error, ratio, ema, rdt, desired, self.context_name, self.branch,
             )
         self.records.clear()
 
@@ -256,7 +259,7 @@ def enable_adaptive_rdt(
     manager = transformer._context_manager
     context_names = transformer._context_names
     if len(context_names) != 1:
-        raise ValueError("Adaptive RDT requires one H3 cache context")
+        raise ValueError("Adaptive RDT requires one cache context per transformer")
     manager.set_context(context_names[0])
     config = manager.current_context.cache_config
     if (
@@ -272,8 +275,18 @@ def enable_adaptive_rdt(
         calibrator, _ = manager.get_calibrator()
         if not isinstance(calibrator, TaylorSeerCalibrator):
             raise ValueError("Adaptive RDT supports only no calibrator or TaylorSeer")
-    if manager.enable_separate_cfg() or not manager.is_cache_residual():
-        raise ValueError("Adaptive RDT requires H3's single-stream residual cache")
+    if not manager.is_cache_residual():
+        raise ValueError("Adaptive RDT requires residual caching")
+    separate_cfg = manager.enable_separate_cfg()
+    controllers = [controller]
+    if separate_cfg:
+        controllers.append(AdaptiveRDT(
+            initial_rdt, envs.SGLANG_CACHE_DIT_RDT_EMA,
+            shadow=shadow, probe_interval=envs.SGLANG_CACHE_DIT_RDT_PROBE_INTERVAL,
+        ))
+    for index, state in enumerate(controllers):
+        state.context_name = context_names[0]
+        state.branch = "cfg" if index else "main"
 
     blocks = transformer.blocks
     first = manager.Fn_compute_blocks()
@@ -283,6 +296,7 @@ def enable_adaptive_rdt(
     if not first < stop <= len(blocks):
         raise ValueError("Adaptive RDT requires a nonempty cached middle segment")
 
+    transformer._sglang_adaptive_rdt_controllers = tuple(controllers)
     manager._sglang_adaptive_rdt = controller
     original_can_cache = manager.can_cache
     original_set_buffer = manager.set_Bn_buffer
@@ -297,6 +311,11 @@ def enable_adaptive_rdt(
             or getattr(manager, "_sglang_sp_group", None)
             or getattr(manager, "_sglang_tp_group", None)
         )
+
+    def owns_context():
+        # Wan 2.2 experts share a manager. Delegate other expert contexts to
+        # the original hook chain; never mix their histories or thresholds.
+        return getattr(manager.current_context, "name", context_names[0]) == context_names[0]
 
     def record(exact):
         controller.record(manager.get_current_step(), exact, probe)
@@ -341,11 +360,20 @@ def enable_adaptive_rdt(
     @torch.compiler.disable
     def can_cache(states_tensor, parallelized=False, threshold=None, prefix="Fn"):
         nonlocal active_context, prediction, predicted_output, actual_output, probe, routing_input
+        nonlocal controller
+        if not owns_context():
+            return original_can_cache(
+                states_tensor, parallelized=parallelized, threshold=threshold, prefix=prefix
+            )
         context = manager.current_context
         if context is not active_context:
-            controller.reset()
+            for state in controllers:
+                state.reset()
             context.cache_config.residual_diff_threshold = initial_rdt
             active_context = context
+        cfg_branch = separate_cfg and manager.is_separate_cfg_step()
+        controller = controllers[int(cfg_branch)]
+        manager._sglang_adaptive_rdt = controller
         controller.initialize(states_tensor)
         if routing_input is None:
             raise RuntimeError("Adaptive RDT did not capture the current middle input")
@@ -362,9 +390,14 @@ def enable_adaptive_rdt(
             and manager.is_in_full_compute_steps()
         )
         max_cached = manager.get_max_cached_steps()
-        total_due = max_cached >= 0 and len(manager.get_cached_steps()) >= max_cached
+        cached_steps = manager.get_cfg_cached_steps() if cfg_branch else manager.get_cached_steps()
+        total_due = max_cached >= 0 and len(cached_steps) >= max_cached
         mc = manager.get_max_continuous_cached_steps()
-        mc_due = mc >= 0 and manager.get_continuous_cached_steps() >= mc
+        continuous = (
+            manager.get_cfg_continuous_cached_steps() if cfg_branch
+            else manager.get_continuous_cached_steps()
+        )
+        mc_due = mc >= 0 and continuous >= mc
         reuse = original_can_cache(
             states_tensor, parallelized=parallelized, threshold=threshold, prefix=prefix
         )
@@ -414,6 +447,8 @@ def enable_adaptive_rdt(
     @torch.compiler.disable
     def set_buffer(buffer, prefix="Bn"):
         nonlocal prediction, predicted_output, actual_output
+        if not owns_context():
+            return original_set_buffer(buffer, prefix=prefix)
         if controller.feedback_eligible:
             measured = actual_output
             if measured is None:
