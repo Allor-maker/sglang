@@ -24,6 +24,7 @@ class AdaptiveRDT:
         self.ratio = None
         self.ema_lambda = 0.9
         self.ema_ratio = None
+        self.exact_count = 0
 
     def capture_input(self, module, args, output):
 

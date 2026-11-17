@@ -683,9 +683,13 @@ def enable_cache_on_transformer(
     original_set_Bn_buffer = manager.set_Bn_buffer
 
     def patched_set_Bn_buffer(buffer, prefix="Bn"):
-        r_hat = manager.get_Bn_buffer(prefix=prefix)
-        controller.observe_prediction(r_hat)
-        return original_set_Bn_buffer(buffer, prefix=prefix)
+        if controller.exact_count >= 3:
+            r_hat = manager.get_Bn_buffer(prefix=prefix)
+            controller.observe_prediction(r_hat, buffer)
+
+        result = original_set_Bn_buffer(buffer, prefix=prefix)
+        controller.exact_count += 1 
+        return result
 
     manager.set_Bn_buffer = patched_set_Bn_buffer
     if custom_adapter is not None:
