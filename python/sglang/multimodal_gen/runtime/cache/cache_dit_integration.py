@@ -57,6 +57,7 @@ except ImportError:
 from sglang.multimodal_gen.runtime.distributed.parallel_state import get_dit_group
 
 from sglang.multimodal_gen.runtime.cache.adaptive_rdt import AdaptiveRDT
+
 _original_similarity = None
 
 
@@ -64,6 +65,18 @@ def disable_cache_on_transformer(transformer: torch.nn.Module) -> torch.nn.Modul
     """Remove Cache-DiT hooks so subsequent requests use the native forward."""
 
     logger.info("Disabling cache-dit on %s", type(transformer).__name__)
+    patch = getattr(transformer, "_adaptive_rdt_original_set_Bn_buffer", None)
+    if patch is not None:
+        manager, original_set_buffer = patch
+        manager.set_Bn_buffer = original_set_buffer
+        del transformer._adaptive_rdt_original_set_Bn_buffer
+    for hook in getattr(transformer, "_adaptive_rdt_hooks", ()):
+        hook.remove()
+    if hasattr(transformer, "_adaptive_rdt_hooks"):
+        del transformer._adaptive_rdt_hooks
+    if hasattr(transformer, "_adaptive_rdt"):
+        transformer._adaptive_rdt.reset()
+        del transformer._adaptive_rdt
     target = getattr(transformer, "_sglang_cache_dit_adapter", transformer)
     cache_dit.disable_cache(target)
     if target is not transformer:
@@ -568,6 +581,9 @@ def enable_cache_on_transformer(
             "Please provide it in CacheDitConfig."
         )
 
+    if hasattr(transformer, "_adaptive_rdt"):
+        disable_cache_on_transformer(transformer)
+
     # Native forward contracts take precedence over cache-dit's family-name matching.
     custom_adapter = _build_custom_block_adapter(
         transformer, has_separate_cfg=has_separate_cfg
@@ -665,33 +681,48 @@ def enable_cache_on_transformer(
         parallelism_config=None,
     )
 
-    blocks = transformer.blocks
-
-    fn = config.Fn_compute_blocks
-    bn = config.Bn_compute_blocks
-    controller = AdaptiveRDT(initial_rdt=0.5)
-
-    input_hook = blocks[fn - 1].register_forward_hook(
-        controller.capture_input
+    is_minimax_h3 = any(
+        cls.__name__ == "MiniMaxH3DiTModel" for cls in type(transformer).__mro__
     )
+    if is_minimax_h3 and config.enable_taylorseer:
+        blocks = transformer.blocks
+        fn = config.Fn_compute_blocks
+        bn = config.Bn_compute_blocks
+        
+        manager = transformer._context_manager
+        controller = AdaptiveRDT(initial_rdt=config.residual_diff_threshold)
+        transformer._adaptive_rdt = controller
+        transformer._adaptive_rdt_hooks = []
+        transformer._adaptive_rdt_hooks.append(
+            blocks[fn - 1].register_forward_hook(controller.capture_input)
+        )
+        transformer._adaptive_rdt_hooks.append(
+            blocks[len(blocks) - bn - 1].register_forward_hook(controller.capture_output)
+        )
+        original_set_buffer = manager.set_Bn_buffer
+        transformer._adaptive_rdt_original_set_Bn_buffer = (manager, original_set_buffer)
 
-    output_hook = blocks[len(blocks) - bn - 1].register_forward_hook(
-        controller.capture_output
-    )
+        def patched_set_Bn_buffer(buffer, prefix="Bn"):
+            calibrator, _ = manager.get_calibrator()
+            state = calibrator.states.get(prefix) if calibrator is not None else None
+            derivatives = state.state.get("dY_current", ()) if state is not None else ()
+            r_hat = (
+                manager.get_Bn_buffer(prefix=prefix)
+                if derivatives and derivatives[0] is not None
+                and torch.is_tensor(controller.last_B) else None
+            )
+            controller.observe_prediction(r_hat, buffer, manager.get_current_step())
+            return original_set_buffer(buffer, prefix=prefix)
 
-    manager = transformer._context_manager
-    original_set_Bn_buffer = manager.set_Bn_buffer
+        def flush_statistics(_module, _args, _output):
+            last_step = manager.current_context.cache_config.num_inference_steps - 1
+            if manager.get_current_step() == last_step:
+                controller.flush(logger)
 
-    def patched_set_Bn_buffer(buffer, prefix="Bn"):
-        if controller.exact_count >= 3:
-            r_hat = manager.get_Bn_buffer(prefix=prefix)
-            controller.observe_prediction(r_hat, buffer)
-
-        result = original_set_Bn_buffer(buffer, prefix=prefix)
-        controller.exact_count += 1 
-        return result
-
-    manager.set_Bn_buffer = patched_set_Bn_buffer
+        manager.set_Bn_buffer = patched_set_Bn_buffer
+        transformer._adaptive_rdt_hooks.append(
+            transformer.register_forward_hook(flush_statistics)
+        )
     if custom_adapter is not None:
         transformer._sglang_cache_dit_adapter = custom_adapter
 
@@ -955,6 +986,9 @@ def refresh_context_on_transformer(
         ),
         verbose=verbose,
     )
+    controller = getattr(transformer, "_adaptive_rdt", None)
+    if controller is not None:
+        controller.reset()
     logger.debug(f"cache-dit refreshed on transformer (steps={num_inference_steps})")
 
 
