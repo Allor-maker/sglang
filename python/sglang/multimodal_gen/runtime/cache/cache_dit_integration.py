@@ -12,7 +12,6 @@ from typing import List, Optional
 import torch
 import torch.distributed as dist
 
-from sglang.multimodal_gen.runtime.cache.adaptive_rdt import enable_adaptive_rdt
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_classifier_free_guidance_world_size,
     get_ring_parallel_world_size,
@@ -57,6 +56,7 @@ except ImportError:
 
 from sglang.multimodal_gen.runtime.distributed.parallel_state import get_dit_group
 
+from sglang.multimodal_gen.runtime.cache.adaptive_rdt import AdaptiveRDT
 _original_similarity = None
 
 
@@ -66,52 +66,12 @@ def disable_cache_on_transformer(transformer: torch.nn.Module) -> torch.nn.Modul
     logger.info("Disabling cache-dit on %s", type(transformer).__name__)
     target = getattr(transformer, "_sglang_cache_dit_adapter", transformer)
     cache_dit.disable_cache(target)
-    for hook in getattr(transformer, "_sglang_adaptive_rdt_hooks", ()):
-        hook.remove()
-    if hasattr(transformer, "_sglang_adaptive_rdt_hooks"):
-        del transformer._sglang_adaptive_rdt_hooks
-    if hasattr(transformer, "_sglang_adaptive_rdt_controllers"):
-        for controller in transformer._sglang_adaptive_rdt_controllers:
-            controller.reset()
-        del transformer._sglang_adaptive_rdt_controllers
     if target is not transformer:
         del transformer._sglang_cache_dit_adapter
     for name in ("_is_parallelized", "_parallelism_config"):
         if hasattr(transformer, name):
             delattr(transformer, name)
     return transformer
-
-
-def _cache_dit_feature_diff(manager, t1, t2, target_group=None, *, check_shape=False):
-    # Adapted from https://github.com/vipshop/cache-dit/blob/main/src/cache_dit/caching/cache_contexts/cache_manager.py#L495-L523
-    condition_thresh = manager.get_important_condition_threshold()
-    if check_shape and t1.shape != t2.shape:
-        # All ranks still enter the reductions and conservatively go exact
-        # if any shard changed shape. Such risk windows cannot calibrate.
-        mean_diff = t1.new_full((), float("inf"))
-        mean_t1 = t1.new_ones(())
-    elif condition_thresh > 0.0:
-        raw_diff = (t1 - t2).abs()
-        token_m_df = raw_diff.mean(dim=-1)
-        token_m_t1 = t1.abs().mean(dim=-1)
-        token_diff = token_m_df / token_m_t1
-        condition = token_diff > condition_thresh
-        if condition.sum() > 0:
-            condition = condition.unsqueeze(-1).expand_as(raw_diff)
-            mean_diff = raw_diff[condition].mean()
-            mean_t1 = t1[condition].abs().mean()
-        else:
-            mean_diff = (t1 - t2).abs().mean()
-            mean_t1 = t1.abs().mean()
-    else:
-        mean_diff = (t1 - t2).abs().mean()
-        mean_t1 = t1.abs().mean()
-
-    if target_group is not None and dist.get_world_size(target_group) > 1:
-        dist.all_reduce(mean_diff, op=dist.ReduceOp.AVG, group=target_group)
-        dist.all_reduce(mean_t1, op=dist.ReduceOp.AVG, group=target_group)
-
-    return mean_diff / mean_t1
 
 
 def _patch_cache_dit_similarity():
@@ -132,12 +92,7 @@ def _patch_cache_dit_similarity():
         parallelized: bool = False,
         prefix: str = "Fn",
     ) -> bool:
-        adaptive = getattr(self, "_sglang_adaptive_rdt", None)
-        if adaptive is not None and adaptive.context_name != getattr(
-            self.current_context, "name", adaptive.context_name
-        ):
-            adaptive = None
-        if not parallelized and adaptive is None:
+        if not parallelized:
             return _original_similarity(
                 self,
                 t1,
@@ -153,9 +108,7 @@ def _patch_cache_dit_similarity():
         target_group = tp_sp_group or sp_group or tp_group
 
         # CFG/DP peers are independent; never fall back to the global group
-        if adaptive is None and (
-            target_group is None or dist.get_world_size(target_group) == 1
-        ):
+        if target_group is None or dist.get_world_size(target_group) == 1:
             return _original_similarity(
                 self,
                 t1,
@@ -165,37 +118,29 @@ def _patch_cache_dit_similarity():
                 prefix=prefix,
             )
 
-        difference = _cache_dit_feature_diff(
-            self, t1, t2, target_group, check_shape=adaptive is not None
-        )
-
-        if adaptive is None:
-            diff = difference.item()
-        else:
-            # One existing host decision sync now carries the cumulative risk
-            # and RDT as well as the original feature difference.
-            adaptive.compared = True
-            if adaptive.current_feature is None:
-                # Standalone similarity users have no forward lifecycle.
-                adaptive.add_risk(difference)
+        # Adapted from https://github.com/vipshop/cache-dit/blob/main/src/cache_dit/caching/cache_contexts/cache_manager.py#L495-L523
+        condition_thresh = self.get_important_condition_threshold()
+        if condition_thresh > 0.0:
+            raw_diff = (t1 - t2).abs()
+            token_m_df = raw_diff.mean(dim=-1)
+            token_m_t1 = t1.abs().mean(dim=-1)
+            token_diff = token_m_df / token_m_t1
+            condition = token_diff > condition_thresh
+            if condition.sum() > 0:
+                condition = condition.unsqueeze(-1).expand_as(raw_diff)
+                mean_diff = raw_diff[condition].mean()
+                mean_t1 = t1[condition].abs().mean()
             else:
-                adaptive.add_feature_risk(target_group)
-            decision_risk = torch.where(
-                adaptive.risk_valid, adaptive.risk,
-                adaptive.risk.new_tensor(float("inf")),
-            )
-            diff, risk, calibrated = torch.stack((
-                difference, decision_risk, adaptive.rdt
-            )).tolist()
-            adaptive.budget_triggered = risk < float("inf") and risk >= calibrated
-            if not adaptive.shadow:
-                self.current_context.cache_config.residual_diff_threshold = calibrated
-                self.add_residual_diff(diff)
-                return risk < calibrated
-            # Shadow retains stock scheduling, including its >=1 sentinel.
-            if threshold >= 1.0:
-                self.add_residual_diff(-1.0)
-                return True
+                mean_diff = (t1 - t2).abs().mean()
+                mean_t1 = t1.abs().mean()
+        else:
+            mean_diff = (t1 - t2).abs().mean()
+            mean_t1 = t1.abs().mean()
+
+        dist.all_reduce(mean_diff, op=dist.ReduceOp.AVG, group=target_group)
+        dist.all_reduce(mean_t1, op=dist.ReduceOp.AVG, group=target_group)
+
+        diff = (mean_diff / mean_t1).item()
         self.add_residual_diff(diff)
         return diff < threshold
 
@@ -627,17 +572,6 @@ def enable_cache_on_transformer(
     custom_adapter = _build_custom_block_adapter(
         transformer, has_separate_cfg=has_separate_cfg
     )
-    if any(cls.__name__ == "WanTransformer3DModel" for cls in type(transformer).__mro__):
-        from sglang.multimodal_gen import envs
-
-        if envs.SGLANG_CACHE_DIT_ADAPTIVE_RDT or envs.SGLANG_CACHE_DIT_ADAPTIVE_RDT_SHADOW:
-            # Native Wan is Pattern_2 (static text input, tensor output).
-            # Honor actual CFG execution, including one call/rank in CFG parallel.
-            custom_adapter = BlockAdapter(
-                transformer=transformer, blocks=transformer.blocks,
-                forward_pattern=ForwardPattern.Pattern_2,
-                has_separate_cfg=has_separate_cfg,
-            )
     if custom_adapter is None and not BlockAdapterRegister.is_supported(transformer):
         transformer_cls_name = transformer.__class__.__name__
         raise ValueError(
@@ -730,6 +664,30 @@ def enable_cache_on_transformer(
         calibrator_config=calibrator_config,
         parallelism_config=None,
     )
+
+    blocks = transformer.blocks
+
+    fn = config.Fn_compute_blocks
+    bn = config.Bn_compute_blocks
+    controller = AdaptiveRDT(initial_rdt=0.5)
+
+    input_hook = blocks[fn - 1].register_forward_hook(
+        controller.capture_input
+    )
+
+    output_hook = blocks[len(blocks) - bn - 1].register_forward_hook(
+        controller.capture_output
+    )
+
+    manager = transformer._context_manager
+    original_set_Bn_buffer = manager.set_Bn_buffer
+
+    def patched_set_Bn_buffer(buffer, prefix="Bn"):
+        r_hat = manager.get_Bn_buffer(prefix=prefix)
+        controller.observe_prediction(r_hat)
+        return original_set_Bn_buffer(buffer, prefix=prefix)
+
+    manager.set_Bn_buffer = patched_set_Bn_buffer
     if custom_adapter is not None:
         transformer._sglang_cache_dit_adapter = custom_adapter
 
@@ -752,21 +710,6 @@ def enable_cache_on_transformer(
         if context_manager is not None:
             # The DiT group spans the CFG ranks (and any TP ranks within them).
             context_manager._sglang_tp_sp_group = get_dit_group()
-
-    if any(
-        cls.__name__ in ("MiniMaxH3DiTModel", "WanTransformer3DModel", "Kandinsky6Transformer3DModel")
-        for cls in type(transformer).__mro__
-    ):
-        if enable_adaptive_rdt(
-            transformer, config.residual_diff_threshold, logger,
-            feature_difference=_cache_dit_feature_diff,
-            blocks=custom_adapter.blocks if custom_adapter is not None else None,
-            joint_streams=any(
-                cls.__name__ == "Kandinsky6Transformer3DModel"
-                for cls in type(transformer).__mro__
-            ) and transformer.config.is_multimodal,
-        ):
-            _patch_cache_dit_similarity()
 
     return transformer
 
@@ -979,14 +922,6 @@ def enable_cache_on_dual_transformer(
                     except Exception:
                         tp_sp_group = None
                 context_manager._sglang_tp_sp_group = tp_sp_group
-
-    if model_name == "wan2.2":
-        for model, config in ((transformer, primary_config), (transformer_2, secondary_config)):
-            if enable_adaptive_rdt(
-                model, config.residual_diff_threshold, logger,
-                feature_difference=_cache_dit_feature_diff,
-            ):
-                _patch_cache_dit_similarity()
 
     return transformer, transformer_2
 

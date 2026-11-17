@@ -128,10 +128,6 @@ def _install_sglang_dependency_stubs():
             pass
 
     logging_utils.init_logger = lambda _name: _FakeLogger()
-    adaptive_rdt = types.ModuleType("sglang.multimodal_gen.runtime.cache.adaptive_rdt")
-    # These tests exercise mount plumbing with Adaptive RDT disabled. The real
-    # controller/opt-out contract has separate CPU tensor coverage.
-    adaptive_rdt.enable_adaptive_rdt = lambda *_args, **_kwargs: False
 
     return {
         "sglang": sglang,
@@ -141,7 +137,6 @@ def _install_sglang_dependency_stubs():
         "sglang.multimodal_gen.runtime.distributed.parallel_state": parallel_state,
         "sglang.multimodal_gen.runtime.utils": utils,
         "sglang.multimodal_gen.runtime.utils.logging_utils": logging_utils,
-        adaptive_rdt.__name__: adaptive_rdt,
     }
 
 
@@ -350,54 +345,6 @@ def _make_transformer(class_name, layers=None):
 
 
 class TestBuildCustomBlockAdapter(unittest.TestCase):
-    def test_adaptive_mount_uses_persistent_manager_with_native_blocks(self):
-        # cache-dit swaps in CachedBlocks only during forward. A native first
-        # block must not prevent mounting adaptive hooks before generation.
-        stubs = _install_sglang_dependency_stubs()
-        stubs.update(_install_torch_stub())
-        stubs["torch"].compiler = types.SimpleNamespace(disable=lambda fn: fn)
-        envs = types.ModuleType("sglang.multimodal_gen.envs")
-        envs.SGLANG_CACHE_DIT_ADAPTIVE_RDT = True
-        envs.SGLANG_CACHE_DIT_ADAPTIVE_RDT_SHADOW = False
-        envs.SGLANG_CACHE_DIT_RDT_EMA = 0.9
-        envs.SGLANG_CACHE_DIT_RDT_PROBE_INTERVAL = 16
-        stubs[envs.__name__] = envs
-        stubs["sglang.multimodal_gen"].envs = envs
-        context = types.SimpleNamespace(cache_config=types.SimpleNamespace())
-        manager = types.SimpleNamespace(
-            current_context=context,
-            set_context=lambda name: None,
-            is_calibrator_enabled=lambda: False,
-            enable_separate_cfg=lambda: False,
-            is_cache_residual=lambda: True,
-            can_cache=lambda *args, **kwargs: False,
-            set_Bn_buffer=lambda *args, **kwargs: None,
-            Fn_compute_blocks=lambda: 1,
-            Bn_compute_blocks=lambda: 1,
-        )
-        native_block = types.SimpleNamespace(
-            register_forward_pre_hook=Mock(return_value=Mock()),
-            register_forward_hook=Mock(return_value=Mock()),
-        )
-        transformer = types.SimpleNamespace(
-            blocks=[types.SimpleNamespace(register_forward_hook=Mock(return_value=Mock())), native_block, object()],
-            _context_manager=manager,
-            _context_names=["h3"],
-        )
-        original_decide = manager.can_cache
-        original_commit = manager.set_Bn_buffer
-        path = Path(__file__).resolve().parents[2] / "runtime/cache/adaptive_rdt.py"
-        with patch.dict(sys.modules, stubs):
-            spec = importlib.util.spec_from_file_location("adaptive_mount_test", path)
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
-            self.assertTrue(module.enable_adaptive_rdt(transformer, 0.5, Mock()))
-        self.assertIs(transformer.blocks[1], native_block)
-        self.assertEqual(len(transformer._sglang_adaptive_rdt_hooks), 3)
-        self.assertIsNot(manager.can_cache, original_decide)
-        self.assertIsNot(manager.set_Bn_buffer, original_commit)
-        self.assertEqual(manager._sglang_adaptive_rdt.initial_rdt, 0.5)
-
     def test_fsdp_subclass_preserves_native_adapter(self):
         module = _import_module_with_stub()
         for name, attr, multimodal, pattern in (
@@ -645,70 +592,6 @@ class TestCalibratorSelection(unittest.TestCase):
 
                 adapter = module.cache_dit.enable_calls[0]["target"]
                 self.assertEqual(adapter.has_separate_cfg, runtime_flag)
-
-    def test_adaptive_wan_single_adapter_uses_runtime_cfg(self):
-        for enabled in (False, True):
-            for separate_cfg in (False, True):
-                with self.subTest(enabled=enabled, separate_cfg=separate_cfg):
-                    module = _import_module_with_stub()
-                    transformer = _make_transformer("WanTransformer3DModel")
-                    transformer.blocks = ["block_0"]
-                    dependencies = _install_sglang_dependency_stubs()
-                    dependencies["sglang.multimodal_gen"].envs = types.SimpleNamespace(
-                        SGLANG_CACHE_DIT_ADAPTIVE_RDT=enabled,
-                        SGLANG_CACHE_DIT_ADAPTIVE_RDT_SHADOW=False,
-                    )
-                    module.enable_adaptive_rdt = Mock(return_value=enabled)
-                    module._patch_cache_dit_similarity = Mock()
-                    with patch.dict(sys.modules, dependencies):
-                        module.enable_cache_on_transformer(
-                            transformer, self._config(module), has_separate_cfg=separate_cfg
-                        )
-                    target = module.cache_dit.enable_calls[0]["target"]
-                    if enabled:
-                        self.assertIs(target.transformer, transformer)
-                        self.assertEqual(target.forward_pattern, module.ForwardPattern.Pattern_2)
-                        self.assertEqual(target.has_separate_cfg, separate_cfg)
-                    else:
-                        self.assertIs(target, transformer)
-                    self.assertIs(module.enable_adaptive_rdt.call_args.args[0], transformer)
-
-    def test_adaptive_kandinsky6_uses_visual_blocks_and_joint_mode(self):
-        for multimodal in (False, True):
-            with self.subTest(multimodal=multimodal):
-                module = _import_module_with_stub()
-                transformer = _make_transformer("Kandinsky6Transformer3DModel")
-                transformer.config = types.SimpleNamespace(is_multimodal=multimodal)
-                transformer.visual_transformer_blocks = ["block_0"]
-                module.enable_adaptive_rdt = Mock(return_value=True)
-                module._patch_cache_dit_similarity = Mock()
-                module.enable_cache_on_transformer(transformer, self._config(module))
-                kwargs = module.enable_adaptive_rdt.call_args.kwargs
-                self.assertIs(kwargs["blocks"], transformer.visual_transformer_blocks)
-                self.assertIs(kwargs["joint_streams"], multimodal)
-                adapter = module.cache_dit.enable_calls[0]["target"]
-                self.assertEqual(adapter.forward_pattern, "Pattern_0" if multimodal else "Pattern_2")
-
-    def test_adaptive_wan_dual_mount_keeps_expert_thresholds(self):
-        module = _import_module_with_stub()
-        module.ParamsModifier = types.SimpleNamespace
-        high = _make_transformer("WanTransformer3DModel")
-        low = _make_transformer("WanTransformer3DModel")
-        high.blocks = low.blocks = ["block_0"]
-        module.enable_adaptive_rdt = Mock(return_value=True)
-        module._patch_cache_dit_similarity = Mock()
-        module.enable_cache_on_dual_transformer(
-            high, low,
-            self._config(module, residual_diff_threshold=0.3),
-            self._config(module, residual_diff_threshold=0.6),
-        )
-        calls = module.enable_adaptive_rdt.call_args_list
-        self.assertEqual(len(calls), 2)
-        self.assertIs(calls[0].args[0], high)
-        self.assertEqual(calls[0].args[1], 0.3)
-        self.assertIs(calls[1].args[0], low)
-        self.assertEqual(calls[1].args[1], 0.6)
-
 
 
 class TestCacheDitLegacyFallback(unittest.TestCase):
