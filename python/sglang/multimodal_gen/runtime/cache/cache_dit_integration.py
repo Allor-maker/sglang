@@ -69,6 +69,8 @@ def disable_cache_on_transformer(transformer: torch.nn.Module) -> torch.nn.Modul
     if patch is not None:
         manager, original_set_buffer = patch
         manager.set_Bn_buffer = original_set_buffer
+        if hasattr(manager, "_adaptive_rdt"):
+            del manager._adaptive_rdt
         del transformer._adaptive_rdt_original_set_Bn_buffer
     for hook in getattr(transformer, "_adaptive_rdt_hooks", ()):
         hook.remove()
@@ -105,6 +107,9 @@ def _patch_cache_dit_similarity():
         parallelized: bool = False,
         prefix: str = "Fn",
     ) -> bool:
+
+        
+
         if not parallelized:
             return _original_similarity(
                 self,
@@ -132,6 +137,14 @@ def _patch_cache_dit_similarity():
             )
 
         # Adapted from https://github.com/vipshop/cache-dit/blob/main/src/cache_dit/caching/cache_contexts/cache_manager.py#L495-L523
+        controller = getattr(self, "_adaptive_rdt", None)
+        if (controller is not None
+            and controller.current_g is not None
+            and controller.current_scale is not None
+            and torch.is_tensor(controller.B)
+        ):
+            return (controller.B < controller.rdt).item()
+        
         condition_thresh = self.get_important_condition_threshold()
         if condition_thresh > 0.0:
             raw_diff = (t1 - t2).abs()
@@ -692,6 +705,7 @@ def enable_cache_on_transformer(
         manager = transformer._context_manager
         controller = AdaptiveRDT(initial_rdt=config.residual_diff_threshold)
         transformer._adaptive_rdt = controller
+        manager._adaptive_rdt = controller
         transformer._adaptive_rdt_hooks = []
         transformer._adaptive_rdt_hooks.append(
             blocks[fn - 1].register_forward_hook(controller.capture_input)
