@@ -91,17 +91,17 @@ class AdaptiveRDT:
             torch.isfinite(self.ema_ratio), desired_rdt,
             torch.full_like(self.ema_ratio, self.initial_rdt),
         )
-        self.records.append((step, self.last_B, self.current_error, self.ratio, self.ema_ratio))
+        self.records.append((step, self.last_B, self.current_error, self.ratio, self.ema_ratio, self.rdt))
 
     def flush(self, logger):
         if not self.records:
             return
         rank = dist.get_rank() if dist.is_initialized() else 0
         values = torch.stack([torch.stack(row[1:]) for row in self.records]).cpu().tolist()
-        for (step, *_), (B, E, ratio, ema) in zip(self.records, values):
+        for (step, *_), (B, E, ratio, ema, rdt) in zip(self.records, values):
             print(
                 f"[AdaptiveRDT] rank={rank} step={step} "
-                f"B={B:g} E={E:g} ratio={ratio:g} ema={ema:g}",
+                f"B={B:g} E={E:g} ratio={ratio:g} ema={ema:g} rdt={rdt:g}",
                 flush=True,
             )
         self.records.clear()
