@@ -25,12 +25,13 @@ class AdaptiveRDT:
         self.ema_lambda = 0.9
         self.ema_ratio = None
         self.records = []
+        self.tp_sp_group = None
 
     def capture_input(self, module, args, output):
 
         self.current_x = output.detach().clone()
         if self.prev_x is not None:
-            self.delta_x = (self.prev_x.float() - self.current_x.float()).abs().mean()
+            self.delta_x = self.global_mean_abs(self.prev_x.float() - self.current_x.float())
 
             if self.current_g is not None and self.current_scale is not None:
                 self.B += (self.current_g * self.delta_x) / (self.current_scale + self.eps)
@@ -40,23 +41,37 @@ class AdaptiveRDT:
         
         self.current_y = output.detach().clone()
         if (self.anchor_x is not None and self.anchor_y is not None):
-            dy = (self.current_y.float() - self.anchor_y.float()).abs().mean()
-            dx = (self.current_x.float() - self.anchor_x.float()).abs().mean()
+            dy = self.global_mean_abs(self.current_y.float() - self.anchor_y.float())
+            dx = self.global_mean_abs(self.current_x.float() - self.anchor_x.float())
             self.current_g = dy / (dx + self.eps)
 
-        self.current_scale = self.current_y.float().abs().mean()
+        self.current_scale = self.global_mean_abs(self.current_y.float())
         self.anchor_y = self.current_y
         self.anchor_x = self.current_x
         self.last_B = self.B
         self.B = 0
 
+    def global_mean_abs(self, tensor):
+        sum_elem = tensor.abs().sum()
+        num_elem = torch.tensor(tensor.numel(),device=tensor.device)
+        if self.tp_sp_group is not None:
+            dist.all_reduce(sum_elem, op=dist.ReduceOp.SUM, group=self.tp_sp_group)
+            dist.all_reduce(num_elem, op=dist.ReduceOp.SUM, group=self.tp_sp_group)
+
+        return sum_elem / num_elem
+
+    def global_sum(self, tensor):
+        if self.tp_sp_group is not None:
+            dist.all_reduce(tensor, op=dist.ReduceOp.SUM, group=self.tp_sp_group)
+        return tensor
+    
     def observe_prediction(self, r_hat, buffer, step):
         if r_hat is None or not torch.is_tensor(self.last_B):
             return
         assert r_hat.shape == buffer.shape == self.current_y.shape
 
-        error = (r_hat.float() - buffer.float()).pow(2).sum()
-        norm_y = self.current_y.float().pow(2).sum()
+        error = self.global_sum((r_hat.float() - buffer.float()).pow(2).sum())
+        norm_y = self.global_sum(self.current_y.float().pow(2).sum())
         self.current_error = (error / (norm_y + self.eps))
 
         self.ratio = torch.where(
@@ -84,9 +99,10 @@ class AdaptiveRDT:
         rank = dist.get_rank() if dist.is_initialized() else 0
         values = torch.stack([torch.stack(row[1:]) for row in self.records]).cpu().tolist()
         for (step, *_), (B, E, ratio, ema) in zip(self.records, values):
-            logger.info(
-                "[AdaptiveRDT] rank=%d step=%d B=%g E=%g ratio=%g ema=%g",
-                rank, step, B, E, ratio, ema,
+            print(
+                f"[AdaptiveRDT] rank={rank} step={step} "
+                f"B={B:g} E={E:g} ratio={ratio:g} ema={ema:g}",
+                flush=True,
             )
         self.records.clear()
 

@@ -739,12 +739,16 @@ def enable_cache_on_transformer(
                 tp_sp_group = get_dit_group()
 
             context_manager._sglang_tp_sp_group = tp_sp_group
+            if hasattr(transformer, "_adaptive_rdt"):
+                controller.tp_sp_group = context_manager._sglang_tp_sp_group
 
     if joint_cfg_decision and get_classifier_free_guidance_world_size() > 1:
         context_manager = getattr(transformer, "_context_manager", None)
         if context_manager is not None:
             # The DiT group spans the CFG ranks (and any TP ranks within them).
             context_manager._sglang_tp_sp_group = get_dit_group()
+            if hasattr(transformer, "_adaptive_rdt"):
+                controller.tp_sp_group = context_manager._sglang_tp_sp_group
 
     return transformer
 
