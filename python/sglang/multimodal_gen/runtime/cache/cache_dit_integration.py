@@ -760,7 +760,8 @@ def enable_cache_on_transformer(
                 if derivatives and derivatives[0] is not None
                 and torch.is_tensor(controller.last_B) else None
             )
-            controller.observe_prediction(r_hat, buffer, manager.get_current_step())
+            if not manager.is_in_warmup():
+                controller.observe_prediction(r_hat, buffer, manager.get_current_step())
             return original_set_buffer(buffer, prefix=prefix)
 
         def flush_statistics(_module, _args, _output):
