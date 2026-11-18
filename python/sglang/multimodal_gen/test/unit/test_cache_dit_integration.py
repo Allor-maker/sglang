@@ -130,6 +130,10 @@ def _install_sglang_dependency_stubs():
     logging_utils.init_logger = lambda _name: _FakeLogger()
     adaptive_rdt = types.ModuleType("sglang.multimodal_gen.runtime.cache.adaptive_rdt")
     adaptive_rdt.AdaptiveRDT = Mock()
+    environ = types.ModuleType("sglang.srt.environ")
+    environ.envs = types.SimpleNamespace(
+        SGLANG_CACHE_DIT_ADAPTIVE_RDT=types.SimpleNamespace(get=lambda: False)
+    )
 
     return {
         "sglang": sglang,
@@ -140,6 +144,7 @@ def _install_sglang_dependency_stubs():
         "sglang.multimodal_gen.runtime.utils": utils,
         "sglang.multimodal_gen.runtime.utils.logging_utils": logging_utils,
         adaptive_rdt.__name__: adaptive_rdt,
+        environ.__name__: environ,
     }
 
 

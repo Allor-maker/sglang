@@ -286,6 +286,11 @@ class Envs:
     SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION = EnvBool(False)
 
     # ===================================================================
+    # Diffusion Cache-DiT
+    # ===================================================================
+    SGLANG_CACHE_DIT_ADAPTIVE_RDT = EnvBool(False)
+
+    # ===================================================================
     # Model configuration, discovery, and weight loading
     # ===================================================================
     SGLANG_USE_MODELSCOPE = EnvBool(False)

@@ -19,6 +19,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ulysses_parallel_world_size,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.environ import envs
 
 logger = init_logger(__name__)
 
@@ -700,7 +701,11 @@ def enable_cache_on_transformer(
     is_minimax_h3 = any(
         cls.__name__ == "MiniMaxH3DiTModel" for cls in type(transformer).__mro__
     )
-    if is_minimax_h3 and config.enable_taylorseer:
+    if (
+        is_minimax_h3
+        and config.enable_taylorseer
+        and envs.SGLANG_CACHE_DIT_ADAPTIVE_RDT.get()
+    ):
         blocks = transformer.blocks
         fn = config.Fn_compute_blocks
         bn = config.Bn_compute_blocks
