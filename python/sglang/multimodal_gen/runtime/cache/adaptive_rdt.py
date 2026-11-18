@@ -25,6 +25,7 @@ class AdaptiveRDT:
         self.ema_lambda = 0.9
         self.ema_ratio = None
         self.records = []
+        self.decisions = []
         self.tp_sp_group = None
 
     def capture_input(self, module, args, output):
@@ -94,6 +95,16 @@ class AdaptiveRDT:
         self.records.append((step, self.last_B, self.current_error, self.ratio, self.ema_ratio, self.rdt))
 
     def flush(self, logger):
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        if self.decisions:
+            values = torch.stack([torch.stack(row[3:]) for row in self.decisions]).cpu().tolist()
+            for (step, mode, reason, *_), (B, rdt) in zip(self.decisions, values):
+                print(
+                    f"[AdaptiveRDT decision] rank={rank} step={step} mode={mode} "
+                    f"reason={reason} B={B:g} rdt_used={rdt:g}",
+                    flush=True,
+                )
+            self.decisions.clear()
         if not self.records:
             return
         rank = dist.get_rank() if dist.is_initialized() else 0
@@ -122,3 +133,4 @@ class AdaptiveRDT:
         self.ema_ratio = None
         self.rdt = self.initial_rdt
         self.records = []
+        self.decisions = []

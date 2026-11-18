@@ -69,6 +69,8 @@ def disable_cache_on_transformer(transformer: torch.nn.Module) -> torch.nn.Modul
     if patch is not None:
         manager, original_set_buffer = patch
         manager.set_Bn_buffer = original_set_buffer
+        manager.can_cache = transformer._adaptive_rdt_original_can_cache
+        del transformer._adaptive_rdt_original_can_cache
         if hasattr(manager, "_adaptive_rdt"):
             del manager._adaptive_rdt
         del transformer._adaptive_rdt_original_set_Bn_buffer
@@ -143,6 +145,7 @@ def _patch_cache_dit_similarity():
             and controller.current_scale is not None
             and torch.is_tensor(controller.B)
         ):
+            controller.decision_reason = "risk"
             return (controller.B < controller.rdt).item()
         
         condition_thresh = self.get_important_condition_threshold()
@@ -715,6 +718,38 @@ def enable_cache_on_transformer(
         )
         original_set_buffer = manager.set_Bn_buffer
         transformer._adaptive_rdt_original_set_Bn_buffer = (manager, original_set_buffer)
+        original_can_cache = manager.can_cache
+        transformer._adaptive_rdt_original_can_cache = original_can_cache
+
+        def patched_can_cache(states_tensor, *args, **kwargs):
+            controller.decision_reason = "forced"
+            can_reuse = original_can_cache(states_tensor, *args, **kwargs)
+            reason = controller.decision_reason
+            if can_reuse:
+                reason = "reuse"
+            elif manager.is_in_warmup():
+                reason = "warmup"
+            elif reason == "forced":
+                # Follow the guards before MC in cache-dit 1.5.3.
+                cached_steps = manager.get_cached_steps()
+                max_steps = manager.get_max_cached_steps()
+                full_step = (
+                    manager.is_steps_computation_mask_enabled()
+                    and manager.is_in_full_compute_steps()
+                )
+                continuous = manager.get_continuous_cached_steps()
+                if cached_steps and cached_steps[-1] == manager.get_current_step():
+                    continuous -= 1
+                mc = manager.get_max_continuous_cached_steps()
+                if (not full_step and (max_steps < 0 or len(cached_steps) < max_steps)
+                        and mc >= 0 and continuous >= mc):
+                    reason = "MC"
+            controller.decisions.append((
+                manager.get_current_step(), "reuse" if can_reuse else "exact", reason,
+                torch.as_tensor(controller.B, device=states_tensor.device).detach().clone(),
+                torch.as_tensor(controller.rdt, device=states_tensor.device).detach().clone(),
+            ))
+            return can_reuse
 
         def patched_set_Bn_buffer(buffer, prefix="Bn"):
             calibrator, _ = manager.get_calibrator()
@@ -734,6 +769,7 @@ def enable_cache_on_transformer(
                 controller.flush(logger)
 
         manager.set_Bn_buffer = patched_set_Bn_buffer
+        manager.can_cache = patched_can_cache
         transformer._adaptive_rdt_hooks.append(
             transformer.register_forward_hook(flush_statistics)
         )
