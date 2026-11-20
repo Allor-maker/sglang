@@ -31,6 +31,7 @@ class MiniMaxH3TimestepPreparationStage(PipelineStage):
         sigma_shift_scales=None,
         dmd_denoising_steps: tuple[int, ...] | None = None,
         pdd_heads: str | None = None,
+        hyperflow=None,
     ) -> None:
         super().__init__()
         # Per-model sigma shift override (model_index.json "_minimax_h3" release
@@ -38,6 +39,7 @@ class MiniMaxH3TimestepPreparationStage(PipelineStage):
         # serving contract — fl2va and ref2va use video 12 / audio 3 by default.
         self.sigma_shift_scales = sigma_shift_scales
         self.dmd_denoising_steps = dmd_denoising_steps
+        self.hyperflow = hyperflow
         self._pdd_config = None
         # The pipeline resolves the release's fused heads; the env var serves
         # stages built without a pipeline.
@@ -91,6 +93,7 @@ class MiniMaxH3TimestepPreparationStage(PipelineStage):
             plan.default_flow_shift,
             plan.default_audio_flow_shift,
             self.freeze_for_dedup(self.sigma_shift_scales),
+            self.hyperflow,
         )
 
     def _apply_pdd_schedule(self, batch: Req) -> None:
@@ -153,6 +156,22 @@ class MiniMaxH3TimestepPreparationStage(PipelineStage):
 
     def _generate_sigmas_from_plan(self, batch: Req, plan) -> None:
         """Generate the fixed per-modality float32 time-shift schedules."""
+        if self.hyperflow is not None:
+            for name, expected in (
+                ("flow_shift", self.hyperflow.video_shift),
+                ("audio_flow_shift", self.hyperflow.audio_shift),
+            ):
+                requested = getattr(plan, name)
+                if requested is not None and requested != expected:
+                    raise ValueError(f"HyperFlow requires {name}={expected}")
+            expected_sigmas = self.hyperflow.shifted_sigmas(
+                batch.num_inference_steps, warmup=batch.is_warmup
+            )
+            supplied = batch.extra.get(MINIMAX_H3_SIGMAS_EXTRA_KEY)
+            if supplied is not None and supplied != expected_sigmas:
+                raise ValueError("HyperFlow cannot use a different sigma schedule")
+            batch.extra[MINIMAX_H3_SIGMAS_EXTRA_KEY] = expected_sigmas
+            return
         from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.time_request import (
             minimax_h3_time_shift_sigmas,
         )

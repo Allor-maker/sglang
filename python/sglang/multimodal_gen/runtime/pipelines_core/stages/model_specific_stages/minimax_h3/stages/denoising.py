@@ -691,6 +691,9 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
 
         device = current_platform.get_local_torch_device()
         sigmas_video = [float(v) for v in ctx.sigmas["video"]]
+        if getattr(self.transformer, "hyperflow", None) is not None:
+            if self._cache_dit_requested_for_batch(batch):
+                raise ValueError("HyperFlow currently requires Cache-DiT disabled")
         self._maybe_enable_cache_dit_and_torch_compile(
             len(sigmas_video) - 1,
             batch,

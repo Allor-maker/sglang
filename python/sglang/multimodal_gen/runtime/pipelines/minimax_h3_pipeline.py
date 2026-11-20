@@ -25,6 +25,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
     MiniMaxH3TimestepPreparationStage,
     MiniMaxH3VisualEncodingStage,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.hyperflow import (
+    read_hyperflow,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.release_metadata import (
     MiniMaxH3PartitionAdmissionStage,
     MiniMaxH3ReleaseMetadata,
@@ -34,6 +37,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
 
 
 class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
@@ -42,6 +48,29 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
     is_video_pipeline = True
     pipeline_config_cls = MiniMaxH3PipelineConfig
     sampling_params_cls = MiniMaxH3SamplingParams
+
+    def set_lora(self, *args, **kwargs):
+        if getattr(self, "_hyperflow_lora_locked", False):
+            raise ValueError("HyperFlow is a fixed startup adapter; restart to change LoRA")
+        return super().set_lora(*args, **kwargs)
+
+    def deactivate_lora_weights(self, *args, **kwargs):
+        if getattr(self, "_hyperflow_lora_locked", False):
+            raise ValueError(
+                "HyperFlow weights and interval conditioning must stay enabled"
+            )
+        return super().deactivate_lora_weights(*args, **kwargs)
+
+    def unmerge_lora_weights(self, *args, **kwargs):
+        if getattr(self, "_hyperflow_lora_locked", False):
+            raise ValueError("HyperFlow is a fixed startup adapter")
+        return super().unmerge_lora_weights(*args, **kwargs)
+
+    def merge_lora_weights(self, *args, **kwargs):
+        if getattr(self, "_hyperflow_lora_locked", False):
+            raise ValueError("HyperFlow is a fixed startup adapter")
+        return super().merge_lora_weights(*args, **kwargs)
+
     _required_config_modules = [
         "processor",
         "text_encoder",
@@ -56,6 +85,8 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
     ]
 
     def __init__(self, *args, **kwargs):
+        self.hyperflow = None
+        self._hyperflow_lora_locked = False
         # TODO: Enable this check on ROCm after adding ffmpeg to the AMD Docker
         # image and CI dependency installer.
         if not current_platform.is_rocm():
@@ -72,6 +103,18 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
                     "package before starting SGLang."
                 )
         super().__init__(*args, **kwargs)
+        self._hyperflow_lora_locked = self.hyperflow is not None
+        if self.hyperflow is not None:
+            logger.info(
+                "HyperFlow %s loaded: rank=%d, alpha=%d, gate=%g, 8 steps, "
+                "video/audio shifts=%g/%g; startup adapter is fixed",
+                self.hyperflow.version,
+                self.hyperflow.rank,
+                self.hyperflow.alpha,
+                self.hyperflow.gate,
+                self.hyperflow.video_shift,
+                self.hyperflow.audio_shift,
+            )
 
     @staticmethod
     def model_subfolder_for_variant(variant: str) -> str:
@@ -134,6 +177,31 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
                 tasks=tuple(MINIMAX_H3_TASK_PARTITIONS),
             )
         self._apply_release_lora_adapter()
+        detected = read_hyperflow(
+            self.server_args.lora_path, self.server_args.lora_weight_name
+        )
+        if detected is not None:
+            adapter_path, self.hyperflow = detected
+            release = self.release_metadata
+            if (
+                release.dmd_denoising_steps is not None
+                or release.pdd_fused_heads is not None
+                or release.stochastic_sampling
+                or release.lora_adapter is not None
+                or self._resolve_pdd_heads()
+            ):
+                raise ValueError("HyperFlow requires the base MiniMax-H3 release")
+            if (
+                self.server_args.minimax_h3_adaln_online
+                or self.server_args.minimax_h3_adaln_cache_path
+            ):
+                raise ValueError("HyperFlow does not support precomputed/online AdaLN cache")
+            if self.server_args.lora_scale != 1.0 or self.server_args.lora_alpha not in (
+                None,
+                self.hyperflow.alpha,
+            ):
+                raise ValueError("HyperFlow requires lora_scale=1 and the file's lora_alpha")
+            self.server_args.lora_path = adapter_path
         return model_index
 
     def _apply_release_lora_adapter(self) -> None:
@@ -164,6 +232,8 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
     def initialize_pipeline(self, server_args: ServerArgs) -> None:
         self.pdd_heads = self._resolve_pdd_heads()
         transformer = self.get_module("transformer")
+        if getattr(self, "hyperflow", None) is not None:
+            transformer.install_hyperflow(self.hyperflow)
         if (
             self.pdd_heads
             and transformer is not None
@@ -214,6 +284,7 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
         self.add_stage(MiniMaxH3LatentPreparationStage())
         self.add_stage(
             MiniMaxH3TimestepPreparationStage(
+                hyperflow=getattr(self, "hyperflow", None),
                 sigma_shift_scales=sigma_shift_scales,
                 dmd_denoising_steps=(
                     release_metadata.dmd_denoising_steps
