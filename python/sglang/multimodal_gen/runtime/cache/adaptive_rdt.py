@@ -81,7 +81,10 @@ class AdaptiveRDT:
             torch.full_like(self.last_B, float("nan")),
         )
         if self.ema_ratio is None:
-            self.ema_ratio = self.ratio
+            self.ema_ratio = (
+                self.ema_lambda * torch.ones_like(self.ratio)
+                + (1 - self.ema_lambda) * self.ratio
+            )
         else:
             average = self.ema_lambda * self.ema_ratio + (1 - self.ema_lambda) * self.ratio
             average = torch.where(torch.isfinite(self.ema_ratio), average, self.ratio)
