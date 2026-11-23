@@ -26,6 +26,8 @@ class MiniMaxH3DiTArchConfig(DiTArchConfig):
             r"^context_embedder\.(.*)$": r"condition_proj.\1",
             r"^time_embedder\.linear_1\.(.*)$": r"time_embedder.proj_in.\1",
             r"^time_embedder\.linear_2\.(.*)$": r"time_embedder.proj_out.\1",
+            r"^endpoint_time_embedder\.linear_1\.(.*)$": r"endpoint_time_embedder.proj_in.\1",
+            r"^endpoint_time_embedder\.linear_2\.(.*)$": r"endpoint_time_embedder.proj_out.\1",
             r"^time_embedder\.table$": r"adaln_t_table",
             r"^norm_out\.norm\.(.*)$": r"final_layer.norm.\1",
             r"^norm_out\.folded_bias$": r"final_layer.adaln_proj.linear.bias",

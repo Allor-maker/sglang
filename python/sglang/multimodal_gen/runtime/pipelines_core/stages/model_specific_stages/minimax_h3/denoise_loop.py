@@ -31,6 +31,9 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
 from sglang.multimodal_gen.runtime.managers.forward_context import (
     set_forward_context,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.hyperflow import (
+    MiniMaxH3HyperFlow,
+)
 
 MINIMAX_H3_IMGVID_COND_TIMESTEP = 0.999
 # ref2va audio reference anchor timestep
@@ -194,6 +197,14 @@ class _StepTimesteps(NamedTuple):
     inverse_indices: torch.Tensor
     block_combined_indices: torch.Tensor
     fp32_bits: tuple[int, ...]
+
+
+class _HyperFlowStepTimesteps(NamedTuple):
+    unique: torch.Tensor
+    inverse_indices: torch.Tensor
+    block_combined_indices: torch.Tensor
+    fp32_bits: tuple[int, ...]
+    endpoints: torch.Tensor
 
 
 class MiniMaxH3DenoiseBranch:
@@ -361,7 +372,7 @@ class MiniMaxH3DenoiseBranch:
         *,
         video_rows: torch.Tensor,
         audio_rows: torch.Tensor,
-        step_timesteps: _StepTimesteps,
+        step_timesteps: _StepTimesteps | _HyperFlowStepTimesteps,
         adaln_slot: torch.Tensor | None = None,
     ) -> dict[str, Any]:
         x = self.x_buffer
@@ -397,6 +408,8 @@ class MiniMaxH3DenoiseBranch:
             # Device scalar, never a Python int: an int would key one breakable
             # CUDA graph per slot value and go stale when LRU reuses the slot.
             kwargs["adaln_cache_slot"] = adaln_slot
+        if isinstance(step_timesteps, _HyperFlowStepTimesteps):
+            kwargs["endpoint_timesteps"] = step_timesteps.endpoints
         return kwargs
 
     def _expand_step_timesteps(
@@ -408,7 +421,9 @@ class MiniMaxH3DenoiseBranch:
         audio_ref_cond_timestep: float,
         inverse_indices_by_pattern: dict[tuple[int, ...], torch.Tensor],
         block_combined_by_pattern: dict[tuple[int, ...], torch.Tensor],
-    ) -> _StepTimesteps:
+        r_video: float | None = None,
+        r_audio: float | None = None,
+    ) -> _StepTimesteps | _HyperFlowStepTimesteps:
         """Build step-local timestep and AdaLN index tensors.
 
         Packed-sequence timestep semantics: non-media rows (text and padding)
@@ -420,24 +435,32 @@ class MiniMaxH3DenoiseBranch:
         fp32 collision semantics — and inverse indices are index_fill'ed from
         the static position sets.
         """
-        candidates: list[float] = []
+        interval_conditioning = r_video is not None
+        if interval_conditioning != (r_audio is not None):
+            raise ValueError("HyperFlow needs both video and audio endpoints")
+
+        def time_value(t, r):
+            return (float(t), float(r)) if interval_conditioning else float(t)
+
+        candidates = []
         fill_groups: list[tuple[torch.Tensor, int]] = []
         base_slot = -1
         if self.n_video_timestep_rows > 0:
             base_slot = len(candidates)
-            candidates.append(float(t_video))
-        for seq_idx, value in (
-            (self.img_cond_seq_idx, imgvid_cond_timestep),
-            (self.audio_target_seq_idx, t_audio),
-            (self.audio_ref_seq_idx, audio_ref_cond_timestep),
+            candidates.append(time_value(t_video, r_video))
+        for seq_idx, value, endpoint in (
+            (self.img_cond_seq_idx, imgvid_cond_timestep, imgvid_cond_timestep),
+            (self.audio_target_seq_idx, t_audio, r_audio),
+            (self.audio_ref_seq_idx, audio_ref_cond_timestep, audio_ref_cond_timestep),
         ):
             if seq_idx.numel() > 0:
                 fill_groups.append((seq_idx, len(candidates)))
-                candidates.append(float(value))
+                candidates.append(time_value(value, endpoint))
         unique_cpu, slot_to_unique = torch.unique(
             torch.tensor(candidates, dtype=torch.float32, device="cpu"),
             sorted=True,
             return_inverse=True,
+            dim=0 if interval_conditioning else None,
         )
         device = self.img_pos_dev.device
         base_index = int(slot_to_unique[base_slot]) if base_slot >= 0 else 0
@@ -458,6 +481,16 @@ class MiniMaxH3DenoiseBranch:
                 alpha=MINIMAX_H3_ADALN_MODALITY_NUM,
             )
             block_combined_by_pattern[pattern] = block_combined
+        if interval_conditioning:
+            # Deduplicate pairs: equal current times can have different endpoints.
+            # The AdaLN memo must distinguish endpoints as well as current times.
+            return _HyperFlowStepTimesteps(
+                unique_cpu[:, 0].contiguous().to(device),
+                inverse_indices,
+                block_combined,
+                tuple(unique_cpu.view(torch.int32).reshape(-1).tolist()),
+                unique_cpu[:, 1].contiguous().to(device),
+            )
         return _StepTimesteps(
             unique_cpu.to(device),
             inverse_indices,
@@ -472,13 +505,20 @@ class MiniMaxH3DenoiseBranch:
         audio_timesteps: list[float],
         imgvid_cond_noise_aug: float,
         audio_ref_cond_noise_aug: float,
+        video_endpoints: list[float] | None = None,
+        audio_endpoints: list[float] | None = None,
         # True: condition rows keep ``imgvid_cond_noise_aug`` on every step
         # instead of ``max(t, imgvid_cond_noise_aug)``.
         pin_imgvid_cond: bool = False,
-    ) -> list[_StepTimesteps]:
+    ) -> list[_StepTimesteps | _HyperFlowStepTimesteps]:
         """Stage every step's packed timestep state before denoising."""
         if len(video_timesteps) != len(audio_timesteps):
             raise ValueError("video/audio timestep plans must have equal length")
+        if (video_endpoints is None) != (audio_endpoints is None) or any(
+            endpoints is not None and len(endpoints) != len(video_timesteps)
+            for endpoints in (video_endpoints, audio_endpoints)
+        ):
+            raise ValueError("HyperFlow endpoints must align with both timestep plans")
         inverse_indices_by_pattern: dict[tuple[int, ...], torch.Tensor] = {}
         block_combined_by_pattern: dict[tuple[int, ...], torch.Tensor] = {}
         return [
@@ -491,8 +531,10 @@ class MiniMaxH3DenoiseBranch:
                 audio_ref_cond_timestep=max(t_audio, audio_ref_cond_noise_aug),
                 inverse_indices_by_pattern=inverse_indices_by_pattern,
                 block_combined_by_pattern=block_combined_by_pattern,
+                r_video=None if video_endpoints is None else video_endpoints[step],
+                r_audio=None if audio_endpoints is None else audio_endpoints[step],
             )
-            for t_video, t_audio in zip(video_timesteps, audio_timesteps)
+            for step, (t_video, t_audio) in enumerate(zip(video_timesteps, audio_timesteps))
         ]
 
 
@@ -589,6 +631,15 @@ def minimax_h3_denoise_loop(
     audio_target_slice = positive.audio_target_slice
     video_timesteps = [1.0 - sigma for sigma in sigmas_video[:-1]]
     audio_timesteps = [1.0 - sigma for sigma in sigmas_audio[:-1]]
+    hyperflow = isinstance(getattr(model, "hyperflow", None), MiniMaxH3HyperFlow)
+    if hyperflow and renoise_generator is not None:
+        raise ValueError("HyperFlow uses Euler sampling, not re-noising")
+    endpoint_plan = {}
+    if hyperflow:
+        endpoint_plan = {
+            "video_endpoints": [1.0 - sigma for sigma in sigmas_video[1:]],
+            "audio_endpoints": [1.0 - sigma for sigma in sigmas_audio[1:]],
+        }
     # One H2D copy per schedule, preserving the previous Python-float
     # subtraction followed by fp32 conversion.
     video_step_t = torch.tensor(video_timesteps, dtype=torch.float32, device=device)
@@ -598,6 +649,7 @@ def minimax_h3_denoise_loop(
         audio_timesteps=audio_timesteps,
         imgvid_cond_noise_aug=float(imgvid_cond_noise_aug_for_inference),
         audio_ref_cond_noise_aug=float(audio_cond_noise_aug_for_inference),
+        **endpoint_plan,
     )
     # Every step's timesteps are settled by now. Rebuilding AdaLN reads all
     # 24.2 GiB of adaln_proj whatever is missing, so fill the whole request in

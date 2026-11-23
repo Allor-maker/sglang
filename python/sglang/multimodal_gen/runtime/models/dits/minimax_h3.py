@@ -124,6 +124,7 @@ from sglang.multimodal_gen.runtime.managers.forward_context import (
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
     is_layerwise_offloaded_module,
+    iter_materialized_weights,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
 from sglang.multimodal_gen.runtime.models.dits.minimax_h3_adaln_cache import (
@@ -264,6 +265,7 @@ _FORWARD_SUPPORTED_KWARGS = frozenset(
         "img_position_ids",
         "rope_cache",
         "unique_timesteps",
+        "endpoint_timesteps",
         "adaln_cache_slot",
         "adaln_timestep_bits",
         "inverse_indices",
@@ -2397,11 +2399,59 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
     reverse_param_names_mapping = _ARCH_DEFAULTS.reverse_param_names_mapping
     lora_param_names_mapping = _ARCH_DEFAULTS.lora_param_names_mapping
 
+    def install_hyperflow(self, config) -> None:
+        """Copy the unadapted time MLP before the startup LoRA is applied."""
+        if self.time_embedder is None or self.adaln_cache is not None:
+            raise ValueError("HyperFlow requires the full H3 time MLP without AdaLN cache")
+        endpoint = MiniMaxH3TimeEmbedder(self.arch, prefix="endpoint_time_embedder")
+        device = current_platform.get_local_torch_device()
+        endpoint.to(device=device)
+        sources = dict(iter_materialized_weights(self))
+        with torch.no_grad():
+            for name, parameter in endpoint.named_parameters():
+                source = sources[f"time_embedder.{name}"].detach().to(device)
+                if isinstance(source, DTensor):
+                    source = source.full_tensor()
+                if source.shape != parameter.shape:
+                    raise ValueError(f"HyperFlow base time MLP shape mismatch: {name}")
+                parameter.copy_(source)
+        endpoint.requires_grad_(False)
+        endpoint.eval()
+        self.endpoint_time_embedder = endpoint
+        self.hyperflow = config
+
     def prepare_lora_adapter(
         self, adapter: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
         """Project released-checkpoint AdaLN LoRAs onto pruned coordinates."""
         _reject_non_lora_delta_tensors(adapter)
+        endpoint_keys = [
+            key for key in adapter if key.startswith("endpoint_time_embedder.")
+        ]
+        hyperflow = getattr(self, "hyperflow", None)
+        if endpoint_keys and hyperflow is None:
+            raise ValueError(
+                "HyperFlow must be loaded at startup from a local --lora-path file"
+            )
+        if hyperflow is not None:
+            from sglang.multimodal_gen.runtime.layers.lora.linear import BaseLayerWithLoRA
+
+            mapping = get_param_names_mapping(self.param_names_mapping)
+            expected = {
+                mapping(key.removesuffix(".weight"))[0] for key in hyperflow.keys
+            }
+            actual = {key for key in adapter if key.endswith((".lora_A", ".lora_B"))}
+            if actual != expected:
+                raise ValueError(
+                    "HyperFlow adapter does not match its startup weight manifest"
+                )
+            modules = dict(self.named_modules())
+            for key in actual:
+                name = key.rsplit(".", 1)[0]
+                if not isinstance(modules.get(name), BaseLayerWithLoRA):
+                    raise ValueError(
+                        f"HyperFlow target was not converted to a LoRA layer: {name}"
+                    )
         if self._adaln_precomputed:
             _reject_adaln_lora(list(adapter))
         full_width = self.arch.adaln_affine_input_dim
@@ -3043,10 +3093,24 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
         if self.adaln_cache is not None:
             self.adaln_cache.load(self.video_patch_proj.weight.device)
 
-    def _time_embedding(self, timesteps: torch.Tensor) -> torch.Tensor:
+    def _time_embedding(
+        self, timesteps: torch.Tensor, endpoint_timesteps: torch.Tensor | None = None
+    ) -> torch.Tensor:
         if self.adaln_t_table is None:
             assert self.time_embedder is not None
-            return self.time_embedder(timesteps)
+            embedding = self.time_embedder(timesteps)
+            hyperflow = getattr(self, "hyperflow", None)
+            if hyperflow is not None:
+                if (
+                    endpoint_timesteps is None
+                    or endpoint_timesteps.shape != timesteps.shape
+                ):
+                    raise ValueError("HyperFlow requires one endpoint for every time pair")
+                endpoint = self.endpoint_time_embedder(endpoint_timesteps)
+                embedding = embedding + hyperflow.gate * (endpoint - embedding)
+            elif endpoint_timesteps is not None:
+                raise ValueError("Endpoint timesteps require a HyperFlow adapter")
+            return embedding
 
         grid = self.adaln_t_table.shape[0]
         position = timesteps.to(_FP32_DTYPE).clamp(0, 1) * (grid - 1)
@@ -3197,6 +3261,7 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
         device: torch.device,
         refined_prompt_embeds_length: int | torch.Tensor | None = None,
         local_embedding_layout: dict[str, torch.Tensor | int] | None = None,
+        endpoint_timesteps: torch.Tensor | None = None,
         out: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Build embeddings for one contiguous block-stack row shard.
@@ -3331,7 +3396,9 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
                 audio_embed.to(_BF16_DTYPE),
             )
 
-        return embeddings, self._time_embedding(unique_timesteps)
+        if endpoint_timesteps is None:
+            return embeddings, self._time_embedding(unique_timesteps)
+        return embeddings, self._time_embedding(unique_timesteps, endpoint_timesteps)
 
     def forward(self, **kwargs: Any) -> tuple[torch.Tensor, torch.Tensor]:
         """Packed inference forward.
@@ -3504,6 +3571,7 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
             device=device,
             refined_prompt_embeds_length=kwargs.get("refined_prompt_embeds_length"),
             local_embedding_layout=kwargs.get("local_embedding_layout"),
+            endpoint_timesteps=kwargs.get("endpoint_timesteps"),
         )
         self.release_mps_non_layer_weights(*embed_weight_prefixes)
         # request-step AdaLN input shared by all blocks
