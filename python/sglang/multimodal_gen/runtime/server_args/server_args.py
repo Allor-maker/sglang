@@ -508,6 +508,7 @@ class ServerArgs(DisaggServerArgsMixin):
 
     # Compilation
     enable_torch_compile: bool = False
+    enable_vae_torch_compile: bool = False
     regional_compile: bool = False
 
     # PyTorch's two approximate numerics defaults, set explicitly per worker
@@ -1608,7 +1609,9 @@ class ServerArgs(DisaggServerArgsMixin):
         if self.warmup_num_frames is not None and self.warmup_num_frames <= 0:
             raise ValueError("--warmup-num-frames must be a positive integer.")
 
-        if self.enable_torch_compile and self.warmup_mode is None:
+        if (
+            self.enable_torch_compile or self.enable_vae_torch_compile
+        ) and self.warmup_mode is None:
             self.warmup_mode = "server"
             logger.info(
                 "Automatically enabled server warmup for torch.compile so first "
@@ -2700,6 +2703,14 @@ class ServerArgs(DisaggServerArgsMixin):
             + "When no warmup mode is configured, this enables server warmup "
             + "so first real requests do not pay compile latency. "
             + "However, will likely cause precision drifts. See (https://github.com/pytorch/pytorch/issues/145213)",
+        )
+        parser.add_argument(
+            "--enable-vae-torch-compile",
+            action=StoreBoolean,
+            default=ServerArgs.enable_vae_torch_compile,
+            help="Compile VAE decoding without enabling DiT compilation. "
+            "Uses TorchAir on NPU. Enables server warmup when no warmup mode "
+            "is configured; compilation may change numerical rounding.",
         )
         parser.add_argument(
             "--regional-compile",
