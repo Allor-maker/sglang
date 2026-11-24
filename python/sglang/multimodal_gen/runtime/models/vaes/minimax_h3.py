@@ -29,6 +29,12 @@ from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.klvae import
 
 class MiniMaxH3VideoVAE(AutoencoderKLLegacy, LayerwiseOffloadableModuleMixin):
     layerwise_offload_dit_group_enabled = False
+    # Compile repeated compute regions rather than unrolling the full clip's
+    # tile/window loops and distributed assembly into one enormous graph.
+    _compile_conditions = [
+        lambda name, _: name.startswith("decoder.transformer_blocks.")
+        and name.count(".") == 2
+    ]
     # EncoderFCN3D indexes its down containers instead of calling them, so they
     # cannot host layerwise hooks. Keep the small encoder resident.
     layer_names = ["decoder.transformer_blocks"]
