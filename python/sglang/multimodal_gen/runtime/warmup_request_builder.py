@@ -532,9 +532,9 @@ def _resolve_warmup_steps(
     if not server_based_warmup:
         return warmup_steps
 
-    if (
-        server_args.enable_torch_compile or server_args.enable_vae_torch_compile
-    ) and server_args.is_arg_explicitly_set("warmup_steps"):
+    if server_args.enable_torch_compile and server_args.is_arg_explicitly_set(
+        "warmup_steps"
+    ):
         return warmup_steps
 
     default_steps = sampling_defaults.num_inference_steps
@@ -716,9 +716,7 @@ def build_warmup_reqs(
         elif negative_prompt is not None and cfg_scale is not None and cfg_scale > 1.0:
             req_kwargs["do_classifier_free_guidance"] = True
 
-        run_real_path_prewarm = server_based_warmup and (
-            server_args.enable_torch_compile or server_args.enable_vae_torch_compile
-        )
+        run_real_path_prewarm = server_based_warmup and server_args.enable_torch_compile
         prompts = (
             (warmup_prompt,) + TORCH_COMPILE_REAL_PATH_PREWARM_PROMPTS
             if run_real_path_prewarm

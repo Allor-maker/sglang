@@ -52,8 +52,6 @@ from sglang.multimodal_gen.runtime.utils.precision import (
 )
 from sglang.multimodal_gen.runtime.utils.torch_compile import (
     ActiveTargetCompiledCallable,
-    CompiledModuleRegistry,
-    resolve_torch_compile_kwargs,
 )
 
 logger = init_logger(__name__)
@@ -315,62 +313,9 @@ class MiniMaxH3DecodingStage(DecodingStage):
         self.video_vae = video_vae
         self.audio_vae = audio_vae
         self._compiled_audio_vae_decode = ActiveTargetCompiledCallable()
-        self._eager_npu_audio_vae = None
-        self._compiled_video_vae_regions = CompiledModuleRegistry()
         # thread and stream of an audio decode that overlaps the video decode
         self._audio_thread: ThreadPoolExecutor | None = None
         self._audio_stream: torch.cuda.Stream | None = None
-
-    def _get_vae_decode_fn(
-        self,
-        vae,
-        server_args: ServerArgs,
-        *,
-        decode_fn=None,
-        compiled_callable: ActiveTargetCompiledCallable | None = None,
-    ):
-        if current_platform.is_npu() and vae is self.audio_vae:
-            # BigVGAN's weight_norm lowers to aten.norm.ScalarOpt_dim, which
-            # the reported TorchAir runtime cannot convert. Compile video
-            # regions only; keep the original audio weights and eager math.
-            if (
-                server_args.enable_torch_compile
-                or server_args.enable_vae_torch_compile
-            ) and self._eager_npu_audio_vae is not vae:
-                logger.warning(
-                    "Keeping MiniMax H3 audio VAE eager on NPU: TorchAir "
-                    "does not support weight_norm's aten.norm.ScalarOpt_dim; "
-                    "video VAE regional compilation remains enabled"
-                )
-                self._eager_npu_audio_vae = vae
-            return decode_fn or vae.decode
-        if not (
-            current_platform.is_npu()
-            and vae is self.video_vae
-            and (
-                server_args.enable_torch_compile
-                or server_args.enable_vae_torch_compile
-            )
-        ):
-            return super()._get_vae_decode_fn(
-                vae,
-                server_args,
-                decode_fn=decode_fn,
-                compiled_callable=compiled_callable,
-            )
-        if not self._compiled_video_vae_regions.is_compiled(vae):
-            compile_kwargs, _ = resolve_torch_compile_kwargs(
-                default="default", module=vae
-            )
-            count = self._compiled_video_vae_regions.compile_regions_once(
-                vae, compile_kwargs=compile_kwargs
-            )
-            logger.info(
-                "Prepared regional TorchAir compilation for %d video VAE blocks; "
-                "compilation runs on first use, tile/window assembly stays eager",
-                count,
-            )
-        return decode_fn or vae.decode
 
     @property
     def role_affinity(self) -> RoleType:

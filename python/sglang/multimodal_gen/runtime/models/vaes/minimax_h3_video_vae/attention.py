@@ -61,14 +61,6 @@ def _math_sdpa(query, key, value):
     return out.to(out_dtype)
 
 
-@torch.compiler.disable
-def _npu_eager_sdpa(query, key, value):
-    # The reported TorchAir SDPA lowering rejects this decoder's dense BNSD
-    # layout ("only supported softmax_layout=TND"). Keep
-    # the existing eager operator at an explicit regional-compile boundary.
-    return F.scaled_dot_product_attention(query, key, value, dropout_p=0.0)
-
-
 def _sdpa_attention(query, key, value):
     """query/key/value: [B, S, H, D]."""
     if _FORCE_ROCM_MATH_SDPA:
@@ -88,10 +80,7 @@ def _sdpa_attention(query, key, value):
         query, key, value = (t.transpose(1, 2) for t in (query, key, value))
         return _math_sdpa(query, key, value).transpose(1, 2)
     query, key, value = (t.transpose(1, 2) for t in (query, key, value))
-    if query.device.type == "npu":
-        out = _npu_eager_sdpa(query, key, value)
-    else:
-        out = F.scaled_dot_product_attention(query, key, value, dropout_p=0.0)
+    out = F.scaled_dot_product_attention(query, key, value, dropout_p=0.0)
     return out.transpose(1, 2)
 
 

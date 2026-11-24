@@ -114,6 +114,12 @@ class VAEProcessor:
             self.transform_rev_inplace = get_denormalize_transform(
                 pixel_norm_type, inplace=True
             )
+        self._npu_denorm_transform = (
+            self.transform_rev
+            if transform_rev is None and transform_rev_inplace is None
+            else None
+        )
+        self._npu_denorm_cache = None
         self.use_3d_conv = use_3d_conv
 
     def _ensure_list(self, data):
@@ -290,6 +296,15 @@ class VAEProcessor:
         into a fresh buffer otherwise.
         """
         if (
+            tensor.device.type == "npu"
+            and self.use_3d_conv
+            and tensor.ndim in (4, 5)
+            and tensor.dtype == torch.float32
+            and not torch.is_grad_enabled()
+            and self.transform_rev is self._npu_denorm_transform
+        ):
+            return self._revert_tensor_npu(tensor, runtime_owned=runtime_owned)
+        if (
             self.use_3d_conv
             and isinstance(self.transform_rev, Normalize)
             and _denorm_kernel_candidate(tensor, _DENORM_FUSION)
@@ -314,6 +329,33 @@ class VAEProcessor:
                         value, mean=mean, std=std, out=out
                     )
         return self._revert_tensor_eager(tensor, runtime_owned=runtime_owned)
+
+    def _revert_tensor_npu(self, tensor, *, runtime_owned):
+        # Broadcast over BCTHW directly. Normalize otherwise needs BTCHW,
+        # recreates device constants, and tests (std == 0).any() on the host.
+        # These built-in inverse stds are already known to be nonzero.
+        value = tensor.unsqueeze(2) if tensor.ndim == 4 else tensor
+        mean = tuple(self.transform_rev.mean)
+        std = tuple(self.transform_rev.std)
+        key = (value.device, value.dtype, mean, std)
+        cached = self._npu_denorm_cache
+        if cached is None or cached[0] != key:
+            shape = (1, -1, 1, 1, 1)
+            mean_tensor = torch.as_tensor(
+                mean, dtype=value.dtype, device=value.device
+            ).view(shape)
+            std_tensor = torch.as_tensor(
+                std, dtype=value.dtype, device=value.device
+            ).view(shape)
+            cached = (key, mean_tensor, std_tensor)
+            self._npu_denorm_cache = cached
+            logger.info("Using direct NPU video denormalization with cached constants")
+        _, mean_tensor, std_tensor = cached
+        if not runtime_owned:
+            value = value.clone(memory_format=torch.contiguous_format)
+        # Keep Normalize's inverse constants and rounding order, rather than
+        # replacing the expression with x * std + mean or a fused multiply-add.
+        return value.sub_(mean_tensor).div_(std_tensor).clamp_(0, 1).contiguous()
 
     def _revert_tensor_eager(self, tensor, *, runtime_owned):
         B, T = None, None
