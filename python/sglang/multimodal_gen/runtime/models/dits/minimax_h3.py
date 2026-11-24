@@ -120,6 +120,7 @@ from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
 from sglang.multimodal_gen.runtime.managers.forward_context import (
     get_forward_context,
     get_forward_context_or_none,
+    request_allows_lossless,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
@@ -2613,6 +2614,9 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
         by the timesteps' bit patterns removes it after the first request with
         the same schedule. The memo holds exactly what the same projection
         computed for the same input, so outputs are bit-identical.
+        On NPU with TP, a miss uses the same batched projection/all-gather as
+        the uncached path; hits reuse its gathered outputs, including dynamic
+        LoRA. All TP ranks must execute the same timestep/request schedule.
         The memo is dropped when an AdaLN weight is rebound and whenever the
         conditioning weights epoch advances: weight updates and LoRA merges
         write in place, and an unmerged LoRA changes the projection without
@@ -2622,17 +2626,22 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
         if (
             timestep_bits is None
             or self.adaln_cache is not None
-            or get_tp_world_size() > 1
+            or (get_tp_world_size() > 1 and adaln_input.device.type != "npu")
             or torch.compiler.is_compiling()
-            # CUDA only: torch.cuda's capture query is a stub on other builds
-            or adaln_input.device.type != "cuda"
-            or torch.cuda.is_current_stream_capturing()
+            or torch.is_grad_enabled()
+            or adaln_input.device.type not in ("cuda", "npu")
             or envs.SGLANG_CACHE_DIT_ENABLED
             or hasattr(self, "_sglang_cache_dit_adapter")
             or is_layerwise_offloaded_module(self)
             or not all(type(block) is MiniMaxH3DiTBlock for block in self.blocks)
             or any(block.adaln_proj is None for block in self.blocks)
         ):
+            return None
+        # Query the owning device API, never CUDA's stub on an NPU build.
+        # Older runtimes without a capture query keep the uncached path.
+        device_module = getattr(torch, adaln_input.device.type)
+        is_capturing = getattr(device_module, "is_current_stream_capturing", None)
+        if is_capturing is None or is_capturing():
             return None
         weights = [block.adaln_proj.linear.weight for block in self.blocks]
         version = (
@@ -2645,20 +2654,34 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
         )
         memo = self.__dict__.get("_adaln_memo")
         if memo is None or memo[0] != version:
+            if memo is None:
+                logger.info(
+                    "MiniMax H3 AdaLN memo enabled on %s (TP=%d, max_entries=%d)",
+                    adaln_input.device,
+                    get_tp_world_size(),
+                    max_entries,
+                )
             memo = (version, {})
             self.__dict__["_adaln_memo"] = memo
         entries = memo[1]
+        context = get_forward_context_or_none()
+        forward_batch = None if context is None else context.forward_batch
         key = (
             timestep_bits,
             tuple(adaln_input.shape),
             adaln_input.dtype,
             adaln_input.device,
+            # Dynamic LoRA may change per request without a weight mutation.
+            float(getattr(forward_batch, "runtime_lora_scale", 1.0)),
+            request_allows_lossless(),
         )
         outputs = entries.pop(key, None)
         if outputs is None:
             outputs = [
                 block.adaln_proj.project_local(adaln_input) for block in self.blocks
             ]
+            if get_tp_world_size() > 1:
+                outputs = tensor_model_parallel_all_gather(torch.stack(outputs))
             while len(entries) >= max_entries:
                 entries.pop(next(iter(entries)))
         entries[key] = outputs
