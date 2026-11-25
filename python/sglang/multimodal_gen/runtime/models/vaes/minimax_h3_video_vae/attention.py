@@ -237,7 +237,7 @@ class Attention(nn.Module):
                 default_attention_backend=AttentionBackendEnum.TORCH_SDPA,
                 skip_sequence_parallel=True,
             )
-            if current_platform.is_cuda()
+            if current_platform.is_cuda() or current_platform.is_npu()
             else None
         )
 
