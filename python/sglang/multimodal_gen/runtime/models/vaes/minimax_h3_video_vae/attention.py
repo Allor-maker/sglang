@@ -17,6 +17,7 @@ from sglang.kernels.ops.diffusion import (
 )
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
+from sglang.multimodal_gen.runtime.layers.layernorm import RMSNormNoWeight
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
@@ -98,7 +99,17 @@ def _vit_norm_input(module, hidden_states):
     return hidden_states.to(weight.dtype if weight is not None else hidden_states.dtype)
 
 
-def _apply_qk_norm(module, hidden_states):
+def _apply_qk_norm(module, hidden_states, *, npu_norm=None):
+    if npu_norm is not None:
+        value = _vit_norm_input(module, hidden_states)
+        eps = module.eps
+        if eps is None:
+            eps = torch.finfo(value.dtype).eps
+        shape = value.shape
+        # The shared weightless NPU op consumes rows over the head dimension.
+        # Preserve the existing FP32-input policy and final activation cast.
+        value = value.reshape(-1, shape[-1]).contiguous()
+        return npu_norm(value, eps=eps).reshape(shape).to(hidden_states.dtype)
     if (
         envs.MINIMAX_H3_VAE_DECODER_VIT_FP32_NORM
         and isinstance(module, (nn.LayerNorm, nn.RMSNorm))
@@ -221,6 +232,13 @@ class Attention(nn.Module):
                 f"unknown qk_norm_type: {qk_norm_type}. Should be None,'layer_norm','rms_norm'"
             )
 
+        self._npu_qk_rms_norm = (
+            RMSNormNoWeight()
+            if current_platform.is_npu()
+            and qk_norm_type == "rms_norm"
+            and not qk_norm_affine
+            else None
+        )
         self.to_qkv = nn.Linear(self.embed_dim, self.attn_inner_dim * 3, bias=bias)
         self.to_out = nn.Linear(self.attn_inner_dim, self.embed_dim, bias=out_bias)
         # Decode ranks process independent complete tiles. Reuse USPAttention's
@@ -260,9 +278,13 @@ class Attention(nn.Module):
             query, key = fused
         else:
             if self.norm_q is not None:
-                query = _apply_qk_norm(self.norm_q, query)
+                query = _apply_qk_norm(
+                    self.norm_q, query, npu_norm=self._npu_qk_rms_norm
+                )
             if self.norm_k is not None:
-                key = _apply_qk_norm(self.norm_k, key)
+                key = _apply_qk_norm(
+                    self.norm_k, key, npu_norm=self._npu_qk_rms_norm
+                )
             if rotary_pos_emb is not None:
                 query, key = apply_rotary_pos_emb_qk(query, key, rotary_pos_emb)
 
