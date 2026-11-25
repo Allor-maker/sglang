@@ -25,6 +25,10 @@ from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.klvae import
     get_tile_parallel_state,
     tile_owners,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
 
 
 class MiniMaxH3VideoVAE(AutoencoderKLLegacy, LayerwiseOffloadableModuleMixin):
@@ -83,10 +87,20 @@ class MiniMaxH3VideoVAE(AutoencoderKLLegacy, LayerwiseOffloadableModuleMixin):
         self.sglang_config = config
         self.use_parallel_decode = config.use_parallel_decode
         self.parallel_decode_mode = parallel_decode_mode
-        # The tiled decode batches under this gate; the CUDA installer registers
-        # it for use_vae_fast_path and adds its attention fusion, so other
-        # platforms keep the one-tile-per-forward decode.
+        # CUDA/ROCm register this gate in their fast-path installer. NPU only
+        # opts into batching, without installing those platforms' fused ops.
         self._sgl_gate = VaeFastPathGate()
+        if current_platform.is_npu():
+            self.decoder_tile_batch = (
+                min(config.decoder_tile_batch, 2) if config.decoder_tile_batch else 2
+            )
+            self.window_batch = 1
+            register_vae_fast_path_gate(self, self._sgl_gate)
+            logger.info(
+                "MiniMax H3 NPU VAE: up to %d tiles per decoder forward for "
+                "lossless/high quality; exact keeps one tile",
+                self.decoder_tile_batch,
+            )
 
     def prepare_decoder_autocast_weights(self, dtype) -> int:
         return self.decoder.prepare_autocast_linear_weights(dtype)

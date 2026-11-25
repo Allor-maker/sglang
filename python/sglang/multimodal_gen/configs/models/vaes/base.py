@@ -230,6 +230,14 @@ class VAEConfig(ModelConfig):
             help="Whether to use parallel decode for VAE",
         )
         parser.add_argument(
+            f"--{prefix}.decoder-tile-batch",
+            type=int,
+            dest=f"{prefix.replace('-', '_')}.decoder_tile_batch",
+            default=None,
+            help="MiniMax H3 decoder tile batch cap (NPU: at most 2); "
+            "1 keeps one tile per forward. Requires lossless/high request quality.",
+        )
+        parser.add_argument(
             f"--{prefix}.parallel-decode-mode",
             choices=("tiled", "patch", "spatial_shard", "spatial", "auto"),
             dest=f"{prefix.replace('-', '_')}.parallel_decode_mode",

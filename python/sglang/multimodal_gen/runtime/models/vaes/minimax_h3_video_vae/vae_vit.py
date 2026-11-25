@@ -108,6 +108,10 @@ def _expand_rotary_batch(rotary_pos_emb, batch: int):
         raise ValueError(
             f"MiniMax H3 VAE rotary cache batch must be 1 or {batch}, got {cos.shape[0]}"
         )
+    if cos.device.type == "npu":
+        # NPU RoPE broadcasts 1S1D across BSND; retain the shared table so
+        # batched tiles keep using the native rotary_mul path.
+        return rotary_pos_emb
     return (
         cos.expand(batch, -1, -1, -1),
         sin.expand(batch, -1, -1, -1),
