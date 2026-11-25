@@ -106,9 +106,10 @@ def _apply_qk_norm(module, hidden_states, *, npu_norm=None):
         if eps is None:
             eps = torch.finfo(value.dtype).eps
         shape = value.shape
-        # The shared weightless NPU op consumes rows over the head dimension.
+        # The NPU implementation expects BLC, not a 2D matrix. Merge sequence
+        # and heads, keeping each head's channels as the normalized dimension.
         # Preserve the existing FP32-input policy and final activation cast.
-        value = value.reshape(-1, shape[-1]).contiguous()
+        value = value.reshape(shape[0], -1, shape[-1]).contiguous()
         return npu_norm(value, eps=eps).reshape(shape).to(hidden_states.dtype)
     if (
         envs.MINIMAX_H3_VAE_DECODER_VIT_FP32_NORM
