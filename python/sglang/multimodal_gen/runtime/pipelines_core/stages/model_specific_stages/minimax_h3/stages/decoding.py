@@ -26,6 +26,9 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency 
     RESIDENT,
 )
 from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import use_vae_fast_path
+from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_vae_graph import (
+    use_minimax_h3_vae_npu_graph,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     StageParallelismType,
@@ -759,6 +762,12 @@ class MiniMaxH3DecodingStage(DecodingStage):
                             selected_video_vae, *self._audio_tile_plan(overlap_audio)
                         ),
                         set_forward_context(current_timestep=0, attn_metadata=None),
+                        use_minimax_h3_vae_npu_graph(
+                            selected_video_vae,
+                            enabled=server_args.enable_minimax_h3_vae_npu_graph,
+                            is_warmup=batch.is_warmup,
+                            residency=server_args.canonical_residency_mode("video_vae"),
+                        ),
                     ):
                         decoded = video_decode(visual_decode_latent, **decode_kwargs)
                     # before closing the encoder, whose x264 and mux tail it overlaps

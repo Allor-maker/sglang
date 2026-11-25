@@ -508,6 +508,7 @@ class ServerArgs(DisaggServerArgsMixin):
 
     # Compilation
     enable_torch_compile: bool = False
+    enable_minimax_h3_vae_npu_graph: bool = False
     regional_compile: bool = False
 
     # PyTorch's two approximate numerics defaults, set explicitly per worker
@@ -1600,6 +1601,16 @@ class ServerArgs(DisaggServerArgsMixin):
         return backend_by_role
 
     def _adjust_warmup(self):
+        if self.enable_minimax_h3_vae_npu_graph:
+            if self.enable_torch_compile:
+                raise ValueError(
+                    "--enable-minimax-h3-vae-npu-graph cannot be combined with "
+                    "--enable-torch-compile"
+                )
+            if self.warmup_mode == "off":
+                raise ValueError("VAE NPU graphs require warmup; remove --warmup-mode off")
+            if self.warmup_mode is None:
+                self.warmup_mode = "server"
         if self.warmup_mode is not None and self.warmup_mode not in WARMUP_MODES:
             raise ValueError(
                 f"Invalid --warmup-mode {self.warmup_mode!r}; "
@@ -2700,6 +2711,14 @@ class ServerArgs(DisaggServerArgsMixin):
             + "When no warmup mode is configured, this enables server warmup "
             + "so first real requests do not pay compile latency. "
             + "However, will likely cause precision drifts. See (https://github.com/pytorch/pytorch/issues/145213)",
+        )
+        parser.add_argument(
+            "--enable-minimax-h3-vae-npu-graph",
+            action=StoreBoolean,
+            default=ServerArgs.enable_minimax_h3_vae_npu_graph,
+            help="Experimental MiniMax H3 video VAE NPU graph segments; "
+            "attention stays eager. Requires resident video_vae weights and "
+            "server warmup with the served video shapes.",
         )
         parser.add_argument(
             "--regional-compile",

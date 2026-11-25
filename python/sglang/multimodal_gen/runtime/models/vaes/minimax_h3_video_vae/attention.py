@@ -22,6 +22,10 @@ from sglang.multimodal_gen.runtime.platforms import (
     current_platform,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    eager_on_graph,
+    is_in_breakable_cuda_graph,
+)
 
 from .vit_utils import apply_rotary_pos_emb_qk, native_rope_cache
 
@@ -266,6 +270,17 @@ class Attention(nn.Module):
             if rotary_pos_emb is not None:
                 query, key = apply_rotary_pos_emb_qk(query, key, rotary_pos_emb)
 
+        if current_platform.is_npu() and is_in_breakable_cuda_graph():
+            hidden_states = self._attention_core_graph(query, key, value)
+        else:
+            hidden_states = self._attention_core(query, key, value)
+
+        hidden_states = hidden_states.reshape(batch_size, seq_len, -1)
+        hidden_states = self.to_out(hidden_states)
+
+        return hidden_states
+
+    def _attention_core(self, query, key, value):
         if self.attn is not None and query.dtype in (torch.float16, torch.bfloat16):
             hidden_states = self.attn(query, key, value)
         else:
@@ -274,7 +289,9 @@ class Attention(nn.Module):
             # change H3's supported precision contract.
             hidden_states = _sdpa_attention(query, key, value)
 
-        hidden_states = hidden_states.reshape(batch_size, seq_len, -1)
-        hidden_states = self.to_out(hidden_states)
-
         return hidden_states
+
+    _attention_core_graph = eager_on_graph(
+        _attention_core,
+        output_factory=lambda self, query, key, value: query.new_empty(query.shape),
+    )
