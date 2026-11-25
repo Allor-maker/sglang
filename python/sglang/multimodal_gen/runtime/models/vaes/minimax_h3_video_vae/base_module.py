@@ -16,6 +16,7 @@ from sglang.kernels.ops.activation.activation import (
 from sglang.kernels.ops.diffusion import try_fused_scaled_residual_add_exact
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.layers.activation import SiluAndMul
+from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
 from sglang.multimodal_gen.runtime.platforms import current_platform
 
 from .attention import Attention
@@ -197,11 +198,13 @@ class TransformerBlock(nn.Module):
         else:
             raise ValueError(f"unknown norm_type {norm_type}")
 
-        self.norm1 = norm_class(
-            dim,
-            elementwise_affine=norm_affine,
-            eps=eps,
-        )
+        norm_kwargs = {"elementwise_affine": norm_affine, "eps": eps}
+        if current_platform.is_npu() and norm_type == "rms_norm" and norm_affine:
+            # Keep the FP32 norm input and separate residual rounding below;
+            # only replace the weighted RMSNorm implementation on NPU.
+            norm_class = RMSNorm
+            norm_kwargs = {"eps": eps}
+        self.norm1 = norm_class(dim, **norm_kwargs)
         self.attn = Attention(
             heads=heads,
             dim_head=dim_head,
@@ -215,11 +218,7 @@ class TransformerBlock(nn.Module):
         if use_scale:
             self.scale1 = nn.Parameter(torch.zeros(dim))
 
-        self.norm2 = norm_class(
-            dim,
-            elementwise_affine=norm_affine,
-            eps=eps,
-        )
+        self.norm2 = norm_class(dim, **norm_kwargs)
         self.ff = FeedForward(
             dim=dim,
             activation_fn=ffn_activation_fn,
