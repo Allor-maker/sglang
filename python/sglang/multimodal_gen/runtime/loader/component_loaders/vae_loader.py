@@ -195,6 +195,7 @@ def _decode_dtype_store_path(
         layout = "|" + ",".join(
             f"{name}:{tuple(tensor.shape)}" for name, tensor in vae.state_dict().items()
         )
+        layout += getattr(vae, "_decode_dtype_cache_tag", "")
     key = hashlib.sha1(
         f"{os.path.realpath(component_model_path)}|{component_name}|{dtype}{layout}".encode()
     ).hexdigest()[:16]
@@ -217,6 +218,16 @@ def _load_store(path: str) -> dict:
     from sglang.multimodal_gen.runtime.loader.utils import _load_safetensors_file
 
     return _load_safetensors_file(path)
+
+
+def _maybe_load_lightvae_decoder(vae, server_args, component_type):
+    path = server_args.minimax_h3_lightvae_decoder_path
+    if path and component_type in ("vae", "video_vae"):
+        from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_lightvae import (
+            load_minimax_h3_lightvae_decoder,
+        )
+
+        load_minimax_h3_lightvae_decoder(vae, path)
 
 
 def _assign_matching_store(vae, mapped: dict, dtype: torch.dtype) -> bool:
@@ -576,6 +587,11 @@ class VAELoader(WeightOverrideComponentLoader):
         config = get_diffusers_component_config(component_path=component_model_path)
         server_args.model_paths[component_name] = component_model_path
         native_only = self.is_native_only_component(server_args, component_name)
+        if (
+            server_args.minimax_h3_lightvae_decoder_path
+            and self.structural_component_type(component_name) in ("vae", "video_vae")
+        ):
+            native_only = True
         _require_native_loader_for_quantized_vae(
             config,
             component_name,
@@ -743,6 +759,7 @@ class VAELoader(WeightOverrideComponentLoader):
                     logger.info(
                         "VAE: converted %d Conv3d weights to channels_last_3d", n
                     )
+            _maybe_load_lightvae_decoder(vae, server_args, component_type)
             _hold_decoder_weights_in_decode_dtype(vae, server_args, component_name)
             return current_platform.optimize_vae(vae)
 
@@ -816,6 +833,7 @@ class VAELoader(WeightOverrideComponentLoader):
             if n > 0:
                 logger.info("VAE: converted %d Conv3d weights to channels_last_3d", n)
 
+        _maybe_load_lightvae_decoder(vae, server_args, component_type)
         _hold_decoder_weights_in_decode_dtype(
             vae,
             server_args,

@@ -435,6 +435,8 @@ class ServerArgs(DisaggServerArgsMixin):
     transformer_weights_path: str | None = None
     # path to precomputed MiniMax H3 AdaLN outputs for inference-only serving.
     minimax_h3_adaln_cache_path: str | None = None
+    # Optional decoder-only ModelTC LightVAE checkpoint; keep the base encoder.
+    minimax_h3_lightvae_decoder_path: str | None = None
     # None lets the model choose; False explicitly keeps resident projections.
     minimax_h3_adaln_online: bool | None = None
     # None chooses 2 for image releases, otherwise MINIMAX_H3_ADALN_MAX_PLAN_WIDTH.
@@ -741,6 +743,19 @@ class ServerArgs(DisaggServerArgsMixin):
         self._validate_batching()
         self._validate_breakable_cuda_graph()
         self._validate_minimax_h3_adaln()
+        if self.minimax_h3_lightvae_decoder_path:
+            from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
+                MiniMaxH3PipelineConfig,
+            )
+
+            if not isinstance(self.pipeline_config, MiniMaxH3PipelineConfig):
+                raise ValueError(
+                    "--minimax-h3-lightvae-decoder-path requires MiniMax H3"
+                )
+            if not os.path.isfile(
+                os.path.expanduser(self.minimax_h3_lightvae_decoder_path)
+            ):
+                raise ValueError("MiniMax H3 LightVAE decoder file does not exist")
         parse_request_time_limits(self.request_time_limit)
         self.pipeline_config.validate_server_args(self)
 
@@ -2344,6 +2359,13 @@ class ServerArgs(DisaggServerArgsMixin):
                 "server, each request on its task's; the automatic memory "
                 "policy keeps both resident when they fit)."
             ),
+        )
+        parser.add_argument(
+            "--minimax-h3-lightvae-decoder-path",
+            type=str,
+            default=ServerArgs.minimax_h3_lightvae_decoder_path,
+            help="Path to the standard non-INT8 H3 LightVAE decoder safetensors. "
+            "Replace only the video decoder; retain the original encoder and audio VAE.",
         )
         parser.add_argument(
             "--minimax-h3-adaln-online",
