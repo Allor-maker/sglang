@@ -163,7 +163,7 @@ def apply_rotary_pos_emb_qk(
     key: torch.Tensor,
     rotary_pos_emb: Sequence[torch.Tensor],
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Apply the exact native NeoX rotary kernel to Q/K together when possible."""
+    """Use native NeoX rotation where available, preserving unrotated channels."""
     native = native_rope_cache(query, key, rotary_pos_emb)
     if native is not None:
         from sgl_kernel import rotary_embedding
@@ -180,6 +180,36 @@ def apply_rotary_pos_emb_qk(
             True,
         )
         return query, key
+
+    cos, sin = rotary_pos_emb[:2]
+    if (
+        query.device.type == "npu"
+        and query.shape == key.shape
+        and query.dtype == key.dtype
+        and query.dtype in (torch.float16, torch.bfloat16)
+        and query.ndim == 4
+        and cos.shape == sin.shape
+        and cos.ndim == 4
+        and cos.shape[:3] == (1, query.shape[1], 1)
+        and query.shape[2] < 1000
+        and 0 < cos.shape[-1] <= query.shape[-1]
+        and cos.shape[-1] < 896
+        and cos.shape[-1] % 2 == 0
+    ):
+        import torch_npu
+
+        # Same BSND + 1S1D split-half contract as RotaryEmbedding.forward_npu.
+        # VAE rotates 48/64 channels by default; do not rotate the tail.
+        rotary_dim = cos.shape[-1]
+        cos, sin = cos.to(query.dtype), sin.to(query.dtype)
+        query_rot = torch_npu.npu_rotary_mul(query[..., :rotary_dim], cos, sin)
+        key_rot = torch_npu.npu_rotary_mul(key[..., :rotary_dim], cos, sin)
+        if rotary_dim == query.shape[-1]:
+            return query_rot, key_rot
+        return (
+            torch.cat((query_rot, query[..., rotary_dim:]), dim=-1),
+            torch.cat((key_rot, key[..., rotary_dim:]), dim=-1),
+        )
 
     return (
         apply_rotary_pos_emb(query, rotary_pos_emb),
