@@ -15,6 +15,7 @@ from sglang.multimodal_gen.runtime.distributed import (
     model_parallel_is_initialized,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import CYAN, RESET, init_logger
 
@@ -29,7 +30,12 @@ def can_encode_while_decoding(
 ) -> bool:
     """Rank-independent eligibility, including ranks that only decode audio/video."""
     return (
-        batch.save_output
+        # Match CudaVideoEncoder.open before callbacks normalize any frames.
+        # Unsupported devices otherwise discard that work and normalize again
+        # after decode; on NPU it also introduces a mid-decode stream sync.
+        current_platform.device_type == "cuda"
+        and hasattr(os, "memfd_create")
+        and batch.save_output
         and batch.return_file_paths_only
         and not batch.return_raw_frames
         and not (batch.extra or {}).get("retain_decoded_frames", False)
