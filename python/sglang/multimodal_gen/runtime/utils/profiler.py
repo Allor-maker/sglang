@@ -12,14 +12,20 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import CYAN, RESET, init_
 from sglang.srt.environ import envs as srt_envs
 from sglang.srt.utils.torch_npu_patch_utils import apply_torch_npu_patches
 
-if current_platform.is_npu():
-    import torch_npu
-
-    patches = [
-        ["profiler.profile", torch_npu.profiler.profile],
-        ["profiler.schedule", torch_npu.profiler.schedule],
-    ]
-    apply_torch_npu_patches(torch_npu, patches)
+if current_platform.is_npu():  
+    import torch_npu  
+  
+    patches = [  
+        ["profiler.profile", torch_npu.profiler.profile],  
+        ["profiler.schedule", torch_npu.profiler.schedule],  
+    ]  
+    apply_torch_npu_patches(torch_npu, patches)  
+  
+    # torch_npu >= 2.10.0.post7: _apply_all_patches() ignores the custom  
+    # patch list, so ensure the profiler symbols are actually patched.  
+    if torch.profiler.profile is not torch_npu.profiler.profile:  
+        torch.profiler.profile = torch_npu.profiler.profile  
+        torch.profiler.schedule = torch_npu.profiler.schedule
 
 logger = init_logger(__name__)
 
